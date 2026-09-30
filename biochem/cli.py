@@ -7,7 +7,12 @@ import json
 import sys
 from pathlib import Path
 
-from .analysis import conserved_quantities, run_short_experiments, validate_trajectory_conservation
+from .analysis import (
+    compare_scenarios,
+    conserved_quantities,
+    run_short_experiments,
+    validate_trajectory_conservation,
+)
 from .deterministic import rk4_scan
 from .models import build_conservation_network
 from .persistence import load_model, load_state, save_model, save_state
@@ -39,6 +44,29 @@ def parse_condition(spec: str) -> tuple[float, dict[str, float]]:
     if not rate_constants:
         raise argparse.ArgumentTypeError(f"condition {spec!r} changes nothing")
     return time_value, rate_constants
+
+
+def parse_scenario(spec: str) -> tuple[str, dict[str, float]]:
+    """Parse LABEL:REACTION=RATE[,REACTION=RATE...] into a forked scenario."""
+
+    try:
+        label, assignments_text = spec.split(":", 1)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid scenario {spec!r}; expected LABEL:REACTION=RATE"
+        ) from None
+    rate_constants: dict[str, float] = {}
+    for assignment in assignments_text.split(","):
+        try:
+            reaction_id, rate_text = assignment.split("=", 1)
+            rate_constants[reaction_id.strip()] = float(rate_text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"invalid assignment {assignment!r}; expected REACTION=RATE"
+            ) from None
+    if not rate_constants:
+        raise argparse.ArgumentTypeError(f"scenario {spec!r} changes nothing")
+    return label.strip(), rate_constants
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -105,6 +133,44 @@ def cmd_deterministic(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_compare(args: argparse.Namespace) -> None:
+    if args.state and Path(args.state).exists():
+        base = StochasticRunner.from_state(load_state(args.state))
+    else:
+        model = load_model(args.model)
+        base = StochasticRunner(model, seed=args.seed)
+        if args.checkpoint is not None:
+            base.run(end_time=args.checkpoint)
+    scenarios = dict(args.scenario)
+    results = compare_scenarios(base, scenarios, args.end_time)
+    if args.state_dir:
+        state_dir = Path(args.state_dir)
+        for label, state in results.items():
+            save_state(state, state_dir / f"{label}.json")
+    print_json(
+        {
+            "checkpoint_time": base.state.time,
+            "scenarios": {
+                label: {
+                    "time": state.time,
+                    "events": len(state.events),
+                    "counts": state.counts,
+                    "conserved": conserved_quantities(state.counts),
+                    "condition_events": [
+                        change.to_dict() for change in state.condition_events
+                    ],
+                    "state_path": (
+                        str(Path(args.state_dir) / f"{label}.json")
+                        if args.state_dir
+                        else None
+                    ),
+                }
+                for label, state in results.items()
+            },
+        }
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Offline synthetic biochemical reaction experiments")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -140,6 +206,35 @@ def build_parser() -> argparse.ArgumentParser:
     deterministic_parser.add_argument("--end-time", type=float, required=True)
     deterministic_parser.add_argument("--step-size", type=float, default=0.05)
     deterministic_parser.set_defaults(func=cmd_deterministic)
+
+    compare_parser = subparsers.add_parser(
+        "compare",
+        help="fork independent condition scenarios from one checkpoint",
+    )
+    compare_parser.add_argument("--model", default="artifacts/model.json")
+    compare_parser.add_argument("--state", default=None, help="checkpoint state to fork from")
+    compare_parser.add_argument("--seed", type=int, default=1)
+    compare_parser.add_argument(
+        "--checkpoint",
+        type=float,
+        default=None,
+        help="run a fresh trajectory to this time before forking",
+    )
+    compare_parser.add_argument("--end-time", type=float, required=True)
+    compare_parser.add_argument(
+        "--scenario",
+        action="append",
+        type=parse_scenario,
+        metavar="LABEL:REACTION=RATE[,REACTION=RATE...]",
+        required=True,
+        help="forked scenario, e.g. fast:catalyze=2.0; each fork has its own RNG state",
+    )
+    compare_parser.add_argument(
+        "--state-dir",
+        default=None,
+        help="optional directory for saving one state file per scenario",
+    )
+    compare_parser.set_defaults(func=cmd_compare)
     return parser
 
 

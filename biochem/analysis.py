@@ -10,6 +10,26 @@ from .models import ExperimentModel
 from .stochastic import StochasticRunner, TrajectoryState
 
 
+def compare_scenarios(
+    base_runner: StochasticRunner,
+    scenarios: dict[str, dict[str, float]],
+    end_time: float,
+) -> dict[str, TrajectoryState]:
+    """Fork independent condition scenarios from one checkpoint.
+
+    Each fork deep-copies the RNG state, so scenarios never share subsequent
+    random draws and the checkpoint runner itself is left untouched.
+    """
+
+    results: dict[str, TrajectoryState] = {}
+    for label, rate_constants in scenarios.items():
+        forked = base_runner.branch(rate_constants=dict(rate_constants), label=label)
+        state = forked.run(end_time=end_time)
+        validate_trajectory_conservation(state)
+        results[label] = state
+    return results
+
+
 CONSERVED_GROUPS = (
     ("enzyme", ("E", "ES")),
     ("substrate_atoms", ("S", "ES", "P")),

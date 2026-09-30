@@ -37,6 +37,22 @@ python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json
 
 `--condition TIME:REACTION=RATE` 可重复指定。变更会作为可重放输入记录在状态的 `condition_schedule` 中，生效后写入 `condition_events`；保存/恢复后按计划继续生效，分段与连续运行结果一致。若下一次抽取的事件会跨过变更时刻，该次试探性抽取被丢弃，时间推进到变更点后用新条件重新抽取。
 
+待处理事件（`pending_event`）与条件生效时刻严格按时间排序处理：若在条件生效前保存、而待处理事件落在条件生效之后，恢复时会回滚这次抽取（`pending_event` 同时保存抽取前后的 RNG 状态），把时间推进到条件点并用新条件重抽，与连续运行完全一致；事件恰好与条件同时刻时仍归属于生效前那次抽取。因此在条件生效前、恰好生效时、紧随其后保存并多次重开，都得到同一条事件序列。
+
+每个不同的条件生效时刻引入一个单调递增的条件版本：初始为 0，同一时刻的多条变更共享同一个版本号。每个反应事件记录其所属的 `condition_version`，`condition_events` 中也记录对应版本，便于说明事件采用的是哪个条件版本。
+
+## 从同一检查点比较不同条件方案
+
+```bash
+python -m biochem.cli compare --model artifacts/model.json --seed 3 \
+    --checkpoint 1.0 --end-time 4 \
+    --scenario fast:catalyze=5.0 \
+    --scenario slow:catalyze=0.01 \
+    --state-dir artifacts/scenarios
+```
+
+`compare` 从同一检查点深拷贝出多个分支（`StochasticRunner.branch` / `TrajectoryState.clone`），每个分支拥有独立的 RNG 状态，方案之间不会共享后续随机抽取；检查点本身不被修改。各分支在检查点时刻应用各自的速率方案后独立推进，并输出守恒检查、事件数和条件版本。
+
 ## 异常停止
 
 运行中发生异常时，状态标记为 `status="failed"`，`failure_reason` 记录失败原因，数量与事件序列保持在最后一次可信状态；CLI 仍会保存状态文件并以非零码退出。
