@@ -201,3 +201,120 @@ def test_failed_run_keeps_last_trusted_state_and_reason(tmp_path):
     assert restored.status == "failed"
     assert restored.failure_reason == runner.state.failure_reason
     assert restored.counts == trusted_counts
+
+
+CONDITION_SEED = 15
+CONDITION_TIME = 2.0
+
+
+def _continuous_with_two_conditions():
+    runner = StochasticRunner(build_conservation_network(), seed=CONDITION_SEED)
+    runner.schedule_condition_change(
+        CONDITION_TIME, {"catalyze": 5.0}, label="boost"
+    )
+    runner.schedule_condition_change(
+        CONDITION_TIME, {"bind": 0.5}, label="damp"
+    )
+    runner.run(6)
+    return runner
+
+
+def test_resume_around_condition_change_matches_continuous_run(tmp_path):
+    continuous = _continuous_with_two_conditions()
+    first_event_after_change = next(
+        event for event in continuous.state.events if event.time > CONDITION_TIME
+    )
+    assert continuous.state.events[0].time < CONDITION_TIME
+    assert first_event_after_change.time > CONDITION_TIME
+
+    save_times = (
+        CONDITION_TIME - 0.25,
+        CONDITION_TIME,
+        CONDITION_TIME + 0.25,
+    )
+    for save_time in save_times:
+        runner = StochasticRunner(build_conservation_network(), seed=CONDITION_SEED)
+        runner.schedule_condition_change(
+            CONDITION_TIME, {"catalyze": 5.0}, label="boost"
+        )
+        runner.schedule_condition_change(
+            CONDITION_TIME, {"bind": 0.5}, label="damp"
+        )
+        runner.run(end_time=save_time)
+        path = tmp_path / f"save_{save_time}.json"
+        save_state(runner.state, path)
+        resumed = StochasticRunner.from_state(load_state(path))
+        resumed.run(end_time=6)
+
+        assert event_dicts(resumed.state) == event_dicts(continuous.state)
+        assert resumed.state.counts == continuous.state.counts
+
+
+def test_simultaneous_changes_form_one_named_condition_version():
+    continuous = _continuous_with_two_conditions()
+
+    applied = continuous.state.condition_events
+    assert [change.time for change in applied] == [CONDITION_TIME, CONDITION_TIME]
+    assert [change.version for change in applied] == [1, 1]
+    assert applied[0].rates_after["catalyze"] == 5.0
+    assert applied[0].rates_after["bind"] == 0.12
+    assert applied[1].rates_after["catalyze"] == 5.0
+    assert applied[1].rates_after["bind"] == 0.5
+
+    versions = {event.condition_version for event in continuous.state.events}
+    assert versions <= {0, 1}
+    before = [e for e in continuous.state.events if e.time < CONDITION_TIME]
+    after = [e for e in continuous.state.events if e.time > CONDITION_TIME]
+    assert before and after
+    assert all(event.condition_version == 0 for event in before)
+    assert all(event.condition_version == 1 for event in after)
+    assert all("condition_version=1" in event.reason for event in after)
+
+
+def test_pending_event_across_change_is_redrawn_without_consuming_extra_draws(tmp_path):
+    continuous = _continuous_with_two_conditions()
+
+    runner = StochasticRunner(build_conservation_network(), seed=CONDITION_SEED)
+    # The condition is only present in the resumed continuation: the saved
+    # pending event was drawn under the old rates and crosses t=2.
+    runner.run(end_time=CONDITION_TIME - 0.25)
+    assert runner.state.pending_event is not None
+    assert runner.state.pending_event["time"] > CONDITION_TIME
+    save_state(runner.state, tmp_path / "pending.json")
+
+    resumed = StochasticRunner.from_state(load_state(tmp_path / "pending.json"))
+    resumed.schedule_condition_change(
+        CONDITION_TIME, {"catalyze": 5.0}, label="boost"
+    )
+    resumed.schedule_condition_change(
+        CONDITION_TIME, {"bind": 0.5}, label="damp"
+    )
+    resumed.run(6)
+
+    assert event_dicts(resumed.state) == event_dicts(continuous.state)
+    assert resumed.state.rng_state == continuous.state.rng_state
+
+
+def test_branches_from_checkpoint_have_independent_random_state():
+    base = StochasticRunner(build_conservation_network(), seed=CONDITION_SEED)
+    base.run(end_time=1.5)
+
+    branch_a = base.fork()
+    branch_b = base.fork()
+    branch_a.schedule_condition_change(
+        CONDITION_TIME, {"catalyze": 5.0}, label="boost"
+    )
+    branch_b.schedule_condition_change(
+        CONDITION_TIME, {"catalyze": 0.01}, label="suppress"
+    )
+
+    branch_a.run(6)
+    branch_b.run(6)
+
+    assert event_dicts(branch_a.state) != event_dicts(branch_b.state)
+    assert branch_a.state.rng_state != branch_b.state.rng_state
+    # Mutating one branch must not bleed into the other or the checkpoint.
+    assert len(base.state.events) < len(branch_a.state.events)
+    assert not base.state.condition_events
+    assert branch_a.state.condition_events[0].label == "boost"
+    assert branch_b.state.condition_events[0].label == "suppress"

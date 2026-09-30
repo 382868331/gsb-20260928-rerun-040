@@ -73,6 +73,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             "condition_events": [
                 change.to_dict() for change in runner.state.condition_events
             ],
+            "condition_version": runner.state.condition_version,
             "failure_reason": failure or runner.state.failure_reason,
             "state_path": args.state,
         }

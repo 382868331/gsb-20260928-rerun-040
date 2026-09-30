@@ -25,9 +25,11 @@ python -m biochem.cli deterministic --model artifacts/model.json --end-time 5 --
 
 第一次 `run` 使用种子生成轨迹并保存随机数状态；第二次直接读取同一个状态继续。保存后重放或继续都会沿同一条随机轨迹，而不是只复用初始种子。每个事件都记录反应编号、发生时间、等待时间、被选倾向、总倾向、数量变化、选择原因和变化后数量。
 
+每条事件还带有 `condition_version`：生成该事件时生效的条件版本号（初始条件为版本 0）。同一时刻声明的多项条件共同构成一个新版本，按声明顺序依次合并；`condition_events` 中每项记录其 `version` 与合并后的完整速率快照 `rates_after`，事件原因字符串也包含所用版本。事件时刻与条件生效时刻恰好相等时，事件先按旧版本触发，条件随即生效。
+
 ## 中途保存与继续
 
-保存可能发生在下一次反应到来之前：已抽出的等待时间和反应会作为 `pending_event` 与推进后的随机数状态一起写入 JSON，恢复时直接沿用，绝不重新抽取。多次分段、恰好落在反应边界、连续运行三种方式在同一 seed 下产生完全相同的事件序列。
+保存可能发生在下一次反应到来之前：已抽出的等待时间和反应会作为 `pending_event` 写入 JSON，同时保存抽取前的随机数状态 `rng_state_before`。恢复时若该事件仍然有效则直接沿用；若在保存后、该事件发生前有条件变更插入，则整个试探性抽取连同其消耗的随机数一起回滚丢弃，在条件生效后重新抽取——因此无论保存点落在条件生效前、恰好生效时还是紧随其后，分段、恢复与连续运行都产生同一条事件序列。
 
 ## 指定时刻改变反应条件
 
@@ -35,7 +37,11 @@ python -m biochem.cli deterministic --model artifacts/model.json --end-time 5 --
 python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json --end-time 5 --condition 2.0:catalyze=3.0
 ```
 
-`--condition TIME:REACTION=RATE` 可重复指定。变更会作为可重放输入记录在状态的 `condition_schedule` 中，生效后写入 `condition_events`；保存/恢复后按计划继续生效，分段与连续运行结果一致。若下一次抽取的事件会跨过变更时刻，该次试探性抽取被丢弃，时间推进到变更点后用新条件重新抽取。
+`--condition TIME:REACTION=RATE` 可重复指定，同一 `TIME` 可给出多项变更。变更会作为可重放输入记录在状态的 `condition_schedule` 中，生效后写入 `condition_events`（含版本号与速率快照）；保存/恢复后按计划继续生效，分段与连续运行结果一致。若下一次抽取的事件会跨过变更时刻，该次试探性抽取连同随机数一并回滚，时间推进到变更点后用新条件重新抽取。
+
+## 从检查点分出条件方案
+
+需要比较不同条件方案时，使用 `StochasticRunner.fork()`（或 `TrajectoryState.fork()`）从同一检查点深拷贝出独立分支。各分支拥有独立的事件列表、条件计划和随机数状态，互不共享后续随机流；在分支上分别 `schedule_condition_change` 后继续运行即可逐事件对比。
 
 ## 异常停止
 

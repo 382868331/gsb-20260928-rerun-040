@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from .models import ExperimentModel, Reaction
@@ -20,6 +20,7 @@ class ReactionEvent:
     changes: dict[str, int]
     reason: str
     counts_after: dict[str, int]
+    condition_version: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -35,6 +36,7 @@ class ReactionEvent:
             changes={str(k): int(v) for k, v in data["changes"].items()},
             reason=str(data["reason"]),
             counts_after={str(k): int(v) for k, v in data["counts_after"].items()},
+            condition_version=int(data.get("condition_version", 0)),
         )
 
 
@@ -45,12 +47,18 @@ class ConditionChange:
     time: float
     rate_constants: dict[str, float]
     label: str = ""
+    version: int | None = None
+    rates_after: dict[str, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "time": self.time,
             "rate_constants": dict(self.rate_constants),
             "label": self.label,
+            "version": self.version,
+            "rates_after": (
+                dict(self.rates_after) if self.rates_after is not None else None
+            ),
         }
 
     @classmethod
@@ -59,6 +67,12 @@ class ConditionChange:
             time=float(data["time"]),
             rate_constants={str(k): float(v) for k, v in data["rate_constants"].items()},
             label=str(data.get("label", "")),
+            version=data.get("version"),
+            rates_after=(
+                {str(k): float(v) for k, v in data["rates_after"].items()}
+                if data.get("rates_after") is not None
+                else None
+            ),
         )
 
 
@@ -73,6 +87,7 @@ class TrajectoryState:
     pending_event: dict[str, Any] | None = None
     condition_schedule: list[ConditionChange] = field(default_factory=list)
     condition_events: list[ConditionChange] = field(default_factory=list)
+    condition_version: int = 0
     failure_reason: str | None = None
 
     def __post_init__(self) -> None:
@@ -96,6 +111,7 @@ class TrajectoryState:
             "pending_event": self.pending_event,
             "condition_schedule": [change.to_dict() for change in self.condition_schedule],
             "condition_events": [change.to_dict() for change in self.condition_events],
+            "condition_version": self.condition_version,
             "failure_reason": self.failure_reason,
             "model": self.model.to_dict(),
         }
@@ -121,8 +137,14 @@ class TrajectoryState:
                 ConditionChange.from_dict(item)
                 for item in data.get("condition_events", [])
             ],
+            condition_version=int(data.get("condition_version", 0)),
             failure_reason=data.get("failure_reason"),
         )
+
+    def fork(self) -> "TrajectoryState":
+        """Deep-copy a checkpoint so branches never share RNG or event state."""
+
+        return TrajectoryState.from_dict(self.to_dict())
 
 
 class StochasticRunner:
@@ -167,6 +189,8 @@ class StochasticRunner:
             time=float(time), rate_constants=dict(rate_constants), label=label
         )
         self.state.condition_schedule.append(change)
+        # Stable ordering: changes scheduled for the same instant keep their
+        # declaration order so a batch is deterministic across save points.
         self.state.condition_schedule.sort(key=lambda item: item.time)
         return change
 
@@ -185,30 +209,50 @@ class StochasticRunner:
         return available, propensities, sum(propensities.values())
 
     def _next_condition_change(self) -> ConditionChange | None:
-        for change in self.state.condition_schedule:
-            if change.time > self.state.time:
-                return change
-        return None
+        return self.state.condition_schedule[0] if self.state.condition_schedule else None
 
-    def _apply_due_condition_changes(self) -> None:
-        """Apply scheduled changes whose time has been reached."""
+    def _apply_due_condition_changes(self, allow_equal: bool = True) -> None:
+        """Apply scheduled changes at or before the current trajectory time.
+
+        ``allow_equal=False`` defers changes tied exactly with the current
+        time; an event at that instant is fired first under the old version,
+        after which the changes take effect.
+        """
+
+        def reached(change: ConditionChange) -> bool:
+            return change.time < self.state.time or (
+                allow_equal and change.time == self.state.time
+            )
+
         due = [
-            change
-            for change in self.state.condition_schedule
-            if change.time <= self.state.time
+            change for change in self.state.condition_schedule if reached(change)
         ]
         if not due:
             return
+
         rate_constants = {
             reaction.id: reaction.rate_constant for reaction in self.model.reactions
         }
+        version = self.state.condition_version
+        recorded: list[ConditionChange] = []
         for change in due:
+            if (
+                not recorded
+                or recorded[-1].time != change.time
+            ):
+                version += 1
             rate_constants.update(change.rate_constants)
+            snapshot = dict(rate_constants)
+            applied = replace(change, version=version, rates_after=dict(snapshot))
+            rate_constants = snapshot
+            recorded.append(applied)
+        for change in recorded:
             self.state.condition_events.append(change)
+        self.state.condition_version = version
         self.state.condition_schedule = [
             change
             for change in self.state.condition_schedule
-            if change.time > self.state.time
+            if not reached(change)
         ]
         reactions = tuple(
             Reaction(
@@ -228,24 +272,55 @@ class StochasticRunner:
         )
         self.state.model = self.model
 
+    def _event_reason(
+        self, propensity: float, total: float, extra: str = ""
+    ) -> str:
+        reason = (
+            f"mass-action propensity {propensity:.12g} selected from total "
+            f"{total:.12g}; all reactant counts were sufficient; "
+            f"condition_version={self.state.condition_version}"
+        )
+        return f"{reason}; {extra}" if extra else reason
+
+    def _discard_pending_event(self, pending: dict[str, Any]) -> None:
+        """Roll back a pre-drawn event invalidated by an intervening change."""
+
+        before = pending.get("rng_state_before")
+        if before is not None:
+            self.state.rng_state = tuple(
+                (int(before[0]), tuple(int(v) for v in before[1]), before[2])
+            )
+
     def step(self) -> ReactionEvent | None:
         if self.state.pending_event is not None:
             pending = self.state.pending_event
+            next_change = self._next_condition_change()
+            if next_change is not None and next_change.time < float(pending["time"]):
+                # A condition now intervenes before the stored pre-drawn event.
+                # Discard that draw and its random numbers, then redraw under
+                # the new version so resume matches a continuous run.
+                self.state.pending_event = None
+                self._discard_pending_event(pending)
+                self.state.time = next_change.time
+                self._apply_due_condition_changes(allow_equal=True)
+                return self.step()
             selected = self.model.reaction(str(pending["reaction_id"]))
             event_time = float(pending["time"])
             if event_time < self.state.time:
                 raise RuntimeError("pending event is earlier than current trajectory time")
             self.state.pending_event = None
+            version = int(pending.get("condition_version", self.state.condition_version))
             return self._apply_event(
                 selected,
                 event_time,
                 float(pending["waiting_time"]),
                 float(pending["propensity"]),
                 float(pending["total_propensity"]),
+                version,
                 str(pending.get("reason", "mass-action event continued from saved state")),
             )
 
-        self._apply_due_condition_changes()
+        self._apply_due_condition_changes(allow_equal=False)
         rng = self._rng()
         available, propensities, total = self._available()
         if total <= 0.0:
@@ -274,13 +349,13 @@ class StochasticRunner:
             waiting_time,
             propensities[selected.id],
             total,
-            (
-                f"mass-action propensity {propensities[selected.id]:.12g} "
-                f"selected from total {total:.12g}; all reactant counts were sufficient"
-            ),
+            self.state.condition_version,
+            self._event_reason(propensities[selected.id], total),
         )
         self.state.rng_state = rng.getstate()
-        return self._apply_built_event(event)
+        applied = self._apply_built_event(event)
+        self._apply_due_condition_changes(allow_equal=True)
+        return applied
 
     def _build_event(
         self,
@@ -289,6 +364,7 @@ class StochasticRunner:
         waiting_time: float,
         propensity: float,
         total_propensity: float,
+        condition_version: int,
         reason: str,
     ) -> ReactionEvent:
         if not self.rule.is_possible(selected, self.state.counts):
@@ -306,6 +382,7 @@ class StochasticRunner:
             changes={k: v for k, v in changes.items() if v != 0},
             reason=reason,
             counts_after=new_counts,
+            condition_version=condition_version,
         )
 
     def _apply_built_event(self, event: ReactionEvent) -> ReactionEvent:
@@ -322,6 +399,7 @@ class StochasticRunner:
         waiting_time: float,
         propensity: float,
         total_propensity: float,
+        condition_version: int,
         reason: str,
     ) -> ReactionEvent:
         event = self._build_event(
@@ -330,9 +408,12 @@ class StochasticRunner:
             waiting_time,
             propensity,
             total_propensity,
+            condition_version,
             reason,
         )
-        return self._apply_built_event(event)
+        applied = self._apply_built_event(event)
+        self._apply_due_condition_changes(allow_equal=True)
+        return applied
 
     def _draw_event(self, rng: random.Random) -> ReactionEvent | None:
         """Draw the next event from the current state without committing it."""
@@ -354,9 +435,9 @@ class StochasticRunner:
             waiting_time,
             propensities[selected.id],
             total,
+            self.state.condition_version,
             (
-                f"mass-action propensity {propensities[selected.id]:.12g} "
-                f"selected from total {total:.12g}; all reactant counts were sufficient"
+                self._event_reason(propensities[selected.id], total)
             ),
         )
 
@@ -370,23 +451,39 @@ class StochasticRunner:
         events_used = 0
         try:
             while max_events is None or events_used < max_events:
-                self._apply_due_condition_changes()
-
                 if self.state.pending_event is not None:
+                    pending = self.state.pending_event
                     pending_time = float(self.state.pending_event["time"])
+                    next_change = self._next_condition_change()
+                    if next_change is not None and next_change.time < pending_time:
+                        # A condition intervenes before the pre-drawn event:
+                        # discard it together with its consumed random draws.
+                        self.state.pending_event = None
+                        self._discard_pending_event(pending)
+                        if end_time is not None and end_time <= next_change.time:
+                            self.state.time = end_time
+                            self._apply_due_condition_changes(allow_equal=True)
+                            self.state.status = "time_limit"
+                            break
+                        self.state.time = next_change.time
+                        self._apply_due_condition_changes(allow_equal=True)
+                        continue
                     if end_time is not None and pending_time > end_time:
                         self.state.time = end_time
                         self.state.status = "time_limit"
                         break
+                    self._apply_due_condition_changes(allow_equal=False)
                     self.step()
                     events_used += 1
                     continue
 
+                self._apply_due_condition_changes(allow_equal=False)
                 if end_time is not None and self.state.time >= end_time:
                     self.state.status = "time_limit"
                     break
 
                 next_change = self._next_condition_change()
+                rng_state_before = self.state.rng_state
                 rng = self._rng()
                 event = self._draw_event(rng)
                 if event is None:
@@ -399,16 +496,16 @@ class StochasticRunner:
                     and event.time > next_change.time
                     and (end_time is None or next_change.time <= end_time)
                 ):
-                    # Conditions change before this event would occur; discard
-                    # the tentative draw (rng_state untouched) and redraw after
-                    # the change so the same schedule replays identically.
+                    # Conditions change first: discard the tentative draw
+                    # without consuming random numbers and redraw afterwards.
                     self.state.time = next_change.time
+                    self._apply_due_condition_changes(allow_equal=True)
                     continue
 
                 if end_time is not None and event.time > end_time:
-                    # Commit the draw: the waiting time and reaction are already
-                    # decided, so a resume must not re-sample them.
-                    self.state.rng_state = rng.getstate()
+                    # Commit the draw itself, but keep the pre-draw RNG state
+                    # so a resume with a newly intervening condition can roll
+                    # the discarded numbers back and stay on one trajectory.
                     self.state.time = end_time
                     self.state.pending_event = {
                         "time": event.time,
@@ -417,15 +514,29 @@ class StochasticRunner:
                         "propensity": event.propensity,
                         "total_propensity": event.total_propensity,
                         "reason": event.reason,
+                        "condition_version": event.condition_version,
+                        "rng_state_before": self._serialize_rng_state(rng_state_before),
                     }
+                    self.state.rng_state = rng.getstate()
                     self.state.status = "time_limit"
                     break
 
                 self.state.rng_state = rng.getstate()
                 self._apply_built_event(event)
+                self._apply_due_condition_changes(allow_equal=True)
                 events_used += 1
         except Exception as exc:
             self.state.status = "failed"
             self.state.failure_reason = f"{type(exc).__name__}: {exc}"
             raise
         return self.state
+
+    @staticmethod
+    def _serialize_rng_state(state: tuple[Any, ...]) -> list[Any]:
+        version, values, gauss = state
+        return [int(version), [int(value) for value in values], gauss]
+
+    def fork(self) -> "StochasticRunner":
+        """Create an independent trajectory branch from this checkpoint."""
+
+        return StochasticRunner.from_state(self.state.fork(), rule=self.rule)
