@@ -101,3 +101,103 @@ def test_exhausted_network_stops_cleanly():
     assert result.status == "exhausted"
     assert result.events == []
     assert result.counts == {"E": 3, "S": 0, "ES": 0, "P": 0}
+
+
+def event_dicts(state):
+    return [event.to_dict() for event in state.events]
+
+
+def test_multiple_segments_match_continuous_run(tmp_path):
+    continuous = StochasticRunner(build_conservation_network(), seed=123).run(6)
+
+    runner = StochasticRunner(build_conservation_network(), seed=123)
+    for index, end_time in enumerate((1.3, 2.7, 4.1, 6.0)):
+        runner.run(end_time=end_time)
+        path = tmp_path / f"segment{index}.json"
+        save_state(runner.state, path)
+        runner = StochasticRunner.from_state(load_state(path))
+
+    assert runner.state.time == continuous.time
+    assert runner.state.counts == continuous.counts
+    assert event_dicts(runner.state) == event_dicts(continuous)
+
+
+def test_boundary_exactly_on_event_time(tmp_path):
+    continuous = StochasticRunner(build_conservation_network(), seed=99).run(6)
+    boundary = continuous.events[3].time
+
+    runner = StochasticRunner(build_conservation_network(), seed=99)
+    runner.run(end_time=boundary)
+    save_state(runner.state, tmp_path / "boundary.json")
+    resumed = StochasticRunner.from_state(load_state(tmp_path / "boundary.json"))
+    resumed.run(end_time=6)
+
+    assert event_dicts(resumed.state) == event_dicts(continuous)
+    assert resumed.state.counts == continuous.counts
+
+
+def test_condition_change_is_replayable_across_segments(tmp_path):
+    continuous = StochasticRunner(build_conservation_network(), seed=5)
+    continuous.schedule_condition_change(2.0, {"catalyze": 2.0, "bind": 0.01}, label="boost")
+    continuous.run(6)
+
+    runner = StochasticRunner(build_conservation_network(), seed=5)
+    runner.schedule_condition_change(2.0, {"catalyze": 2.0, "bind": 0.01}, label="boost")
+    for index, end_time in enumerate((1.0, 3.0, 6.0)):
+        runner.run(end_time=end_time)
+        path = tmp_path / f"cond{index}.json"
+        save_state(runner.state, path)
+        runner = StochasticRunner.from_state(load_state(path))
+
+    assert event_dicts(runner.state) == event_dicts(continuous.state)
+    assert runner.state.counts == continuous.state.counts
+    assert [c.to_dict() for c in runner.state.condition_events] == [
+        c.to_dict() for c in continuous.state.condition_events
+    ]
+    assert runner.state.condition_events[0].rate_constants == {"catalyze": 2.0, "bind": 0.01}
+
+
+def test_condition_change_actually_changes_rates():
+    model = build_conservation_network()
+    runner = StochasticRunner(model, seed=5)
+    runner.schedule_condition_change(0.5, {"bind": 0.0, "catalyze": 50.0})
+    runner.run(4)
+
+    assert runner.state.condition_events
+    after = [e for e in runner.state.events if e.time > 0.5]
+    assert after
+    assert all(e.reaction_id != "bind" for e in after)
+    assert runner.model.reaction("bind").rate_constant == 0.0
+
+
+def test_failed_run_keeps_last_trusted_state_and_reason(tmp_path):
+    runner = StochasticRunner(build_conservation_network(), seed=11)
+    runner.run(end_time=1.0)
+    trusted_counts = dict(runner.state.counts)
+    trusted_events = len(runner.state.events)
+
+    runner.state.pending_event = {
+        "time": runner.state.time + 0.1,
+        "reaction_id": "no-such-reaction",
+        "waiting_time": 0.1,
+        "propensity": 1.0,
+        "total_propensity": 1.0,
+        "reason": "corrupted",
+    }
+    try:
+        runner.run(end_time=3.0)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("expected the corrupted pending event to fail")
+
+    assert runner.state.status == "failed"
+    assert "no-such-reaction" in runner.state.failure_reason
+    assert runner.state.counts == trusted_counts
+    assert len(runner.state.events) == trusted_events
+
+    save_state(runner.state, tmp_path / "failed.json")
+    restored = load_state(tmp_path / "failed.json")
+    assert restored.status == "failed"
+    assert restored.failure_reason == runner.state.failure_reason
+    assert restored.counts == trusted_counts

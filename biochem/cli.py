@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from .analysis import conserved_quantities, run_short_experiments, validate_trajectory_conservation
@@ -15,6 +16,29 @@ from .stochastic import StochasticRunner
 
 def print_json(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def parse_condition(spec: str) -> tuple[float, dict[str, float]]:
+    """Parse TIME:REACTION=RATE[,REACTION=RATE...] into a scheduled change."""
+    try:
+        time_text, assignments_text = spec.split(":", 1)
+        time_value = float(time_text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid condition {spec!r}; expected TIME:REACTION=RATE"
+        ) from None
+    rate_constants: dict[str, float] = {}
+    for assignment in assignments_text.split(","):
+        try:
+            reaction_id, rate_text = assignment.split("=", 1)
+            rate_constants[reaction_id.strip()] = float(rate_text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"invalid assignment {assignment!r}; expected REACTION=RATE"
+            ) from None
+    if not rate_constants:
+        raise argparse.ArgumentTypeError(f"condition {spec!r} changes nothing")
+    return time_value, rate_constants
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -29,8 +53,14 @@ def cmd_run(args: argparse.Namespace) -> None:
     else:
         model = load_model(args.model)
         runner = StochasticRunner(model, seed=args.seed)
-    runner.run(end_time=args.end_time, max_events=args.max_events)
-    validate_trajectory_conservation(runner.state)
+    for time_value, rate_constants in args.condition or []:
+        runner.schedule_condition_change(time_value, rate_constants, label="cli")
+    failure = None
+    try:
+        runner.run(end_time=args.end_time, max_events=args.max_events)
+        validate_trajectory_conservation(runner.state)
+    except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
     if args.state:
         save_state(runner.state, args.state)
     print_json(
@@ -40,9 +70,15 @@ def cmd_run(args: argparse.Namespace) -> None:
             "events": len(runner.state.events),
             "counts": runner.state.counts,
             "conserved": conserved_quantities(runner.state.counts),
+            "condition_events": [
+                change.to_dict() for change in runner.state.condition_events
+            ],
+            "failure_reason": failure or runner.state.failure_reason,
             "state_path": args.state,
         }
     )
+    if failure is not None:
+        sys.exit(1)
 
 
 def cmd_experiments(args: argparse.Namespace) -> None:
@@ -83,6 +119,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--seed", type=int, default=1)
     run_parser.add_argument("--end-time", type=float, required=True)
     run_parser.add_argument("--max-events", type=int)
+    run_parser.add_argument(
+        "--condition",
+        action="append",
+        type=parse_condition,
+        metavar="TIME:REACTION=RATE",
+        help="schedule a replayable rate change, e.g. 2.5:catalyze=0.5",
+    )
     run_parser.set_defaults(func=cmd_run)
 
     batch_parser = subparsers.add_parser("experiments", help="compare many short random runs")

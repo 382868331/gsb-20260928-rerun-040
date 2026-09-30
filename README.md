@@ -24,3 +24,19 @@ python -m biochem.cli deterministic --model artifacts/model.json --end-time 5 --
 ```
 
 第一次 `run` 使用种子生成轨迹并保存随机数状态；第二次直接读取同一个状态继续。保存后重放或继续都会沿同一条随机轨迹，而不是只复用初始种子。每个事件都记录反应编号、发生时间、等待时间、被选倾向、总倾向、数量变化、选择原因和变化后数量。
+
+## 中途保存与继续
+
+保存可能发生在下一次反应到来之前：已抽出的等待时间和反应会作为 `pending_event` 与推进后的随机数状态一起写入 JSON，恢复时直接沿用，绝不重新抽取。多次分段、恰好落在反应边界、连续运行三种方式在同一 seed 下产生完全相同的事件序列。
+
+## 指定时刻改变反应条件
+
+```bash
+python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json --end-time 5 --condition 2.0:catalyze=3.0
+```
+
+`--condition TIME:REACTION=RATE` 可重复指定。变更会作为可重放输入记录在状态的 `condition_schedule` 中，生效后写入 `condition_events`；保存/恢复后按计划继续生效，分段与连续运行结果一致。若下一次抽取的事件会跨过变更时刻，该次试探性抽取被丢弃，时间推进到变更点后用新条件重新抽取。
+
+## 异常停止
+
+运行中发生异常时，状态标记为 `status="failed"`，`failure_reason` 记录失败原因，数量与事件序列保持在最后一次可信状态；CLI 仍会保存状态文件并以非零码退出。
