@@ -11,6 +11,31 @@ from .rules import MassActionRule, ReactionRule
 
 
 @dataclass(frozen=True)
+class ConditionChange:
+    time: float
+    rate_constants: dict[str, float]
+    status: str = "scheduled"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "time": self.time,
+            "rate_constants": dict(self.rate_constants),
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ConditionChange":
+        return cls(
+            time=float(data["time"]),
+            rate_constants={
+                str(reaction_id): float(value)
+                for reaction_id, value in data.get("rate_constants", {}).items()
+            },
+            status=str(data.get("status", "scheduled")),
+        )
+
+
+@dataclass(frozen=True)
 class ReactionEvent:
     time: float
     reaction_id: str
@@ -47,6 +72,9 @@ class TrajectoryState:
     rng_state: tuple[Any, ...] = field(default_factory=random.Random().getstate)
     status: str = "ready"
     pending_event: dict[str, Any] | None = None
+    condition_changes: list[ConditionChange] = field(default_factory=list)
+    failed_at: float | None = None
+    failure_reason: str | None = None
 
     def __post_init__(self) -> None:
         complete_counts = {species.id: 0 for species in self.model.species}
@@ -59,13 +87,16 @@ class TrajectoryState:
     def to_dict(self) -> dict[str, Any]:
         rng_version, rng_values, rng_gauss = self.rng_state
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "time": self.time,
             "counts": dict(self.counts),
             "events": [event.to_dict() for event in self.events],
             "rng_state": [rng_version, list(rng_values), rng_gauss],
             "status": self.status,
             "pending_event": self.pending_event,
+            "condition_changes": [change.to_dict() for change in self.condition_changes],
+            "failed_at": self.failed_at,
+            "failure_reason": self.failure_reason,
             "model": self.model.to_dict(),
         }
 
@@ -74,7 +105,7 @@ class TrajectoryState:
         model = ExperimentModel.from_dict(data["model"])
         rng_data = data["rng_state"]
         rng_state = (int(rng_data[0]), tuple(int(v) for v in rng_data[1]), rng_data[2])
-        return cls(
+        state = cls(
             model=model,
             time=float(data.get("time", 0.0)),
             counts={str(k): int(v) for k, v in data.get("counts", {}).items()},
@@ -82,7 +113,16 @@ class TrajectoryState:
             rng_state=rng_state,
             status=str(data.get("status", "ready")),
             pending_event=data.get("pending_event"),
+            condition_changes=[
+                ConditionChange.from_dict(item)
+                for item in data.get("condition_changes", [])
+            ],
+            failed_at=None if data.get("failed_at") is None else float(data["failed_at"]),
+            failure_reason=data.get("failure_reason"),
         )
+        if int(data.get("schema_version", 1)) < 2:
+            state.legacy_format = True
+        return state
 
 
 class StochasticRunner:
@@ -108,7 +148,26 @@ class StochasticRunner:
         runner.model = state.model
         runner.rule = rule or MassActionRule()
         runner.state = state
+        runner._normalize_legacy_state()
         return runner
+
+    def _normalize_legacy_state(self) -> None:
+        """Advance old state RNGs by the two samples consumed to schedule an event."""
+        if getattr(self.state, "_state_format_normalized", False):
+            return
+        if self.state.pending_event is not None:
+            self.state.pending_event.setdefault("source", "current_conditions")
+        if self.state.pending_event is None:
+            if getattr(self.state, "legacy_format", False):
+                self._draw_next_event()
+        elif getattr(self.state, "legacy_format", False):
+            rng = self._rng()
+            rng.expovariate(1.0)
+            rng.random()
+            self.state.rng_state = rng.getstate()
+        self.state._state_format_normalized = True
+        if hasattr(self.state, "legacy_format"):
+            del self.state.legacy_format
 
     def _rng(self) -> random.Random:
         rng = random.Random()
@@ -124,13 +183,132 @@ class StochasticRunner:
         ]
         return available, propensities, sum(propensities.values())
 
+    def _next_change_index(self, through_time: float | None = None) -> int | None:
+        candidates = [
+            index
+            for index, change in enumerate(self.state.condition_changes)
+            if change.status == "scheduled"
+            and (through_time is None or change.time <= through_time)
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda index: self.state.condition_changes[index].time)
+
+    def _invalidate_pending_for_change(self, change_time: float) -> None:
+        pending = self.state.pending_event
+        if pending is not None and float(pending["time"]) >= change_time:
+            self.state.pending_event = None
+
+    def _apply_due_condition_changes(self, through_time: float) -> None:
+        while True:
+            index = self._next_change_index(through_time)
+            if index is None:
+                return
+            change = self.state.condition_changes[index]
+            same_time_indices = [
+                candidate_index
+                for candidate_index, candidate in enumerate(self.state.condition_changes)
+                if candidate.status == "scheduled" and candidate.time == change.time
+            ]
+            merged_rates: dict[str, float] = {}
+            for candidate_index in same_time_indices:
+                merged_rates.update(self.state.condition_changes[candidate_index].rate_constants)
+            self._invalidate_pending_for_change(change.time)
+            try:
+                new_model = self.model.with_rate_constants(merged_rates)
+                new_model.validate()
+            except (KeyError, ValueError) as exc:
+                for candidate_index in same_time_indices:
+                    candidate = self.state.condition_changes[candidate_index]
+                    self.state.condition_changes[candidate_index] = ConditionChange(
+                        time=candidate.time,
+                        rate_constants=dict(candidate.rate_constants),
+                        status="failed",
+                    )
+                self._fail(change.time, str(exc))
+                raise
+            self.model = new_model
+            self.state.model = new_model
+            self.state.time = change.time
+            for candidate_index in same_time_indices:
+                candidate = self.state.condition_changes[candidate_index]
+                self.state.condition_changes[candidate_index] = ConditionChange(
+                    time=candidate.time,
+                    rate_constants=dict(candidate.rate_constants),
+                    status="applied",
+                )
+            self.state.status = "condition_changed"
+            if self.state.pending_event is None:
+                self._draw_next_event()
+
+    def _draw_next_event(self) -> None:
+        rng = self._rng()
+        available, propensities, total = self._available()
+        if total <= 0.0:
+            self.state.rng_state = rng.getstate()
+            self.state.pending_event = None
+            return
+
+        waiting_time = rng.expovariate(total)
+        cutoff = rng.random() * total
+        cumulative = 0.0
+        selected = available[-1]
+        for candidate in available:
+            cumulative += propensities[candidate.id]
+            if cutoff <= cumulative:
+                selected = candidate
+                break
+
+        self.state.rng_state = rng.getstate()
+        self.state.pending_event = {
+            "time": self.state.time + waiting_time,
+            "reaction_id": selected.id,
+            "waiting_time": waiting_time,
+            "propensity": propensities[selected.id],
+            "total_propensity": total,
+            "source": "current_conditions",
+        }
+
+    def _fail(self, failed_at: float, reason: str) -> None:
+        self.state.status = "failed"
+        self.state.failed_at = failed_at
+        self.state.failure_reason = reason
+
+    def schedule_rate_change(self, time: float, rate_constants: dict[str, float]) -> ConditionChange:
+        if time < self.state.time:
+            raise ValueError("condition change precedes current trajectory time")
+        if not rate_constants:
+            raise ValueError("condition change must update at least one rate constant")
+        values = {str(key): float(value) for key, value in rate_constants.items()}
+        for existing in self.state.condition_changes:
+            if existing.time == time and existing.rate_constants == values:
+                return existing
+        try:
+            probe_model = self.model.with_rate_constants(values)
+            probe_model.validate()
+        except (KeyError, ValueError) as exc:
+            self.state.condition_changes.append(
+                ConditionChange(time=time, rate_constants=values, status="failed")
+            )
+            self._fail(time, str(exc))
+            raise
+        change = ConditionChange(time=time, rate_constants=values)
+        self.state.condition_changes.append(change)
+        self.state.condition_changes.sort(key=lambda item: item.time)
+        self._invalidate_pending_for_change(time)
+        return change
+
     def step(self) -> ReactionEvent | None:
+        if self.state.pending_event is None:
+            self._draw_next_event()
         if self.state.pending_event is not None:
             pending = self.state.pending_event
             selected = self.model.reaction(str(pending["reaction_id"]))
             event_time = float(pending["time"])
             if event_time < self.state.time:
-                raise RuntimeError("pending event is earlier than current trajectory time")
+                reason = "pending event is earlier than current trajectory time"
+                self._fail(event_time, reason)
+                raise RuntimeError(reason)
             self.state.pending_event = None
             event = self._apply_event(
                 selected,
@@ -138,45 +316,19 @@ class StochasticRunner:
                 float(pending["waiting_time"]),
                 float(pending["propensity"]),
                 float(pending["total_propensity"]),
-                "continued pending mass-action event from saved state",
+                (
+                    f"mass-action propensity {float(pending['propensity']):.12g} "
+                    f"selected from total {float(pending['total_propensity']):.12g}; "
+                    "all reactant counts were sufficient"
+                ),
             )
+            self._draw_next_event()
             return event
 
-        rng = self._rng()
-        available, propensities, total = self._available()
-        if total <= 0.0:
-            self.state.rng_state = rng.getstate()
-            self.state.status = "exhausted"
+        self._draw_next_event()
+        if self.state.pending_event is None:
             return None
-
-        waiting_time = rng.expovariate(total)
-        cutoff = rng.random() * total
-        cumulative = 0.0
-        selected: Reaction | None = None
-        for reaction in available:
-            cumulative += propensities[reaction.id]
-            if cutoff <= cumulative:
-                selected = reaction
-                break
-        if selected is None:
-            selected = available[-1]
-
-        if not self.rule.is_possible(selected, self.state.counts):
-            raise RuntimeError(f"rule selected impossible reaction {selected.id}")
-
-        event = self._build_event(
-            selected,
-            self.state.time + waiting_time,
-            waiting_time,
-            propensities[selected.id],
-            total,
-            (
-                f"mass-action propensity {propensities[selected.id]:.12g} "
-                f"selected from total {total:.12g}; all reactant counts were sufficient"
-            ),
-        )
-        self.state.rng_state = rng.getstate()
-        return self._apply_built_event(event)
+        return self.step()
 
     def _build_event(
         self,
@@ -238,66 +390,55 @@ class StochasticRunner:
         if end_time is not None and end_time < self.state.time:
             raise ValueError("end_time precedes current trajectory time")
         events_used = 0
-        while (max_events is None or events_used < max_events) and (
-            end_time is None
-            or self.state.time < end_time
-            or (
-                self.state.pending_event is not None
-                and float(self.state.pending_event["time"]) <= end_time
-            )
-        ):
-            time_before = self.state.time
-            counts_before = dict(self.state.counts)
-            events_before = len(self.state.events)
-            rng_snapshot = self.state.rng_state
-            pending_before = self.state.pending_event
-            if pending_before is not None:
-                event = self.step()
-            else:
-                rng = self._rng()
-                available, propensities, total = self._available()
-                if total <= 0.0:
-                    self.state.rng_state = rng.getstate()
+        self._apply_due_condition_changes(self.state.time)
+        if self.state.pending_event is None and self.state.status not in {"failed", "exhausted"}:
+            self._draw_next_event()
+        while max_events is None or events_used < max_events:
+            pending = self.state.pending_event
+            if pending is None:
+                next_change = self._next_change_index()
+                if next_change is None:
                     self.state.status = "exhausted"
                     break
-                waiting_time = rng.expovariate(total)
-                cutoff = rng.random() * total
-                cumulative = 0.0
-                selected = available[-1]
-                for candidate in available:
-                    cumulative += propensities[candidate.id]
-                    if cutoff <= cumulative:
-                        selected = candidate
-                        break
-                event = self._build_event(
-                    selected,
-                    time_before + waiting_time,
-                    waiting_time,
-                    propensities[selected.id],
-                    total,
-                    "mass-action event selected before boundary check",
-                )
-                self.state.rng_state = rng.getstate()
-            if event is None:
-                break
-            if end_time is not None and event.time > end_time:
+                change = self.state.condition_changes[next_change]
+                if end_time is not None and change.time > end_time:
+                    self.state.time = end_time
+                    self.state.status = "time_limit"
+                    break
+                self._apply_due_condition_changes(change.time)
+                continue
+
+            event_time = float(pending["time"])
+            next_change = self._next_change_index()
+            change_time = (
+                self.state.condition_changes[next_change].time
+                if next_change is not None
+                else None
+            )
+            if change_time is not None and change_time <= event_time:
+                if end_time is not None and change_time > end_time:
+                    self.state.time = end_time
+                    self.state.status = "time_limit"
+                    break
+                self._apply_due_condition_changes(change_time)
+                continue
+            if end_time is not None and event_time > end_time:
                 self.state.time = end_time
-                self.state.counts = counts_before
-                self.state.events = self.state.events[:events_before]
-                self.state.pending_event = pending_before or {
-                    "time": event.time,
-                    "reaction_id": event.reaction_id,
-                    "waiting_time": event.waiting_time,
-                    "propensity": event.propensity,
-                    "total_propensity": event.total_propensity,
-                    "continuing": False,
-                }
-                self.state.rng_state = rng_snapshot
                 self.state.status = "time_limit"
                 break
-            if pending_before is None:
-                self._apply_built_event(event)
+
+            try:
+                self.step()
+            except RuntimeError as exc:
+                self._fail(event_time, str(exc))
+                raise
             events_used += 1
-        if end_time is not None and self.state.time >= end_time and self.state.status != "exhausted":
+
+        if (
+            end_time is not None
+            and self.state.time < end_time
+            and self.state.status not in {"failed", "exhausted"}
+        ):
+            self.state.time = end_time
             self.state.status = "time_limit"
         return self.state

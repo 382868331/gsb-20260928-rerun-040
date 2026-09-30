@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 
@@ -75,6 +75,21 @@ class ExperimentModel:
             if reaction.id == reaction_id:
                 return reaction
         raise KeyError(f"unknown reaction: {reaction_id}")
+
+    def with_rate_constants(self, rate_constants: dict[str, float]) -> "ExperimentModel":
+        updates: dict[str, float] = {}
+        for reaction_id, rate_constant in rate_constants.items():
+            self.reaction(reaction_id)
+            value = float(rate_constant)
+            if value < 0:
+                raise ValueError(f"reaction {reaction_id} has a negative rate constant")
+            updates[reaction_id] = value
+
+        reactions = tuple(
+            replace(reaction, rate_constant=updates.get(reaction.id, reaction.rate_constant))
+            for reaction in self.reactions
+        )
+        return replace(self, reactions=reactions)
 
     def validate(self) -> None:
         ids = self.species_ids

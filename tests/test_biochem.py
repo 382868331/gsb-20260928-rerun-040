@@ -1,4 +1,5 @@
 import json
+import pytest
 
 from biochem.analysis import run_short_experiments, validate_trajectory_conservation
 from biochem.deterministic import rk4_scan
@@ -66,6 +67,102 @@ def test_saved_midpoint_continues_on_same_trajectory(tmp_path):
     assert [event.to_dict() for event in resumed.state.events] == [
         event.to_dict() for event in uninterrupted.events
     ]
+
+
+def test_multiple_arbitrary_and_boundary_splits_match_continuous_run(tmp_path):
+    model = build_conservation_network()
+    uninterrupted = StochasticRunner(model, seed=1234)
+    uninterrupted.run(end_time=8)
+
+    event_times = [event.time for event in uninterrupted.state.events]
+    checkpoints = [0.73, event_times[1], 2.41, event_times[4], 5.8, event_times[-2]]
+
+    split_runner = StochasticRunner(model, seed=1234)
+    state_path = tmp_path / "segmented.json"
+    for checkpoint in checkpoints:
+        split_runner.run(end_time=checkpoint)
+        save_state(split_runner.state, state_path)
+        reloaded = StochasticRunner.from_state(load_state(state_path))
+        split_runner = reloaded
+
+    split_runner.run(end_time=8)
+
+    assert [event.to_dict() for event in split_runner.state.events] == [
+        event.to_dict() for event in uninterrupted.state.events
+    ]
+    assert split_runner.state.counts == uninterrupted.state.counts
+
+
+def test_condition_change_is_replayable_across_restart(tmp_path):
+    model = build_conservation_network()
+    continuous = StochasticRunner(model, seed=321)
+    continuous.schedule_rate_change(2.0, {"bind": 0.4, "catalyze": 0.08})
+    continuous.run(end_time=6)
+
+    state_path = tmp_path / "conditions.json"
+    before = StochasticRunner(model, seed=321)
+    before.schedule_rate_change(2.0, {"bind": 0.4, "catalyze": 0.08})
+    before.run(end_time=1.25)
+    save_state(before.state, state_path)
+
+    resumed = StochasticRunner.from_state(load_state(state_path))
+    resumed.run(end_time=2.0)
+    save_state(resumed.state, state_path)
+
+    after_change = StochasticRunner.from_state(load_state(state_path))
+    after_change.run(end_time=6)
+
+    recorded = [change.to_dict() for change in after_change.state.condition_changes]
+    assert recorded[0]["rate_constants"] == {"bind": 0.4, "catalyze": 0.08}
+    assert recorded[0]["status"] == "applied"
+    assert [event.to_dict() for event in after_change.state.events] == [
+        event.to_dict() for event in continuous.state.events
+    ]
+
+
+def test_condition_change_at_event_boundary_takes_precedence_and_replays(tmp_path):
+    model = build_conservation_network()
+    probe = StochasticRunner(model, seed=77)
+    probe.run(max_events=3)
+    boundary = probe.state.events[1].time
+
+    continuous = StochasticRunner(model, seed=77)
+    continuous.schedule_rate_change(boundary, {"bind": 0.0})
+    continuous.run(end_time=boundary + 3)
+
+    state_path = tmp_path / "boundary-condition.json"
+    first = StochasticRunner(model, seed=77)
+    first.run(end_time=boundary - 0.1)
+    save_state(first.state, state_path)
+
+    resumed = StochasticRunner.from_state(load_state(state_path))
+    resumed.schedule_rate_change(boundary, {"bind": 0.0})
+    resumed.run(end_time=boundary + 3)
+
+    assert [event.to_dict() for event in resumed.state.events] == [
+        event.to_dict() for event in continuous.state.events
+    ]
+
+
+def test_invalid_condition_change_keeps_last_trusted_state_on_failure(tmp_path):
+    model = build_conservation_network()
+    runner = StochasticRunner(model, seed=5)
+    runner.run(end_time=1.0)
+    trusted_events = [event.to_dict() for event in runner.state.events]
+    trusted_counts = dict(runner.state.counts)
+
+    with pytest.raises(KeyError):
+        runner.schedule_rate_change(1.5, {"missing": 0.1})
+
+    state_path = tmp_path / "failed.json"
+    save_state(runner.state, state_path)
+    recovered = load_state(state_path)
+
+    assert recovered.status == "failed"
+    assert recovered.failed_at == 1.5
+    assert "unknown reaction" in (recovered.failure_reason or "")
+    assert recovered.counts == trusted_counts
+    assert [event.to_dict() for event in recovered.events] == trusted_events
 
 
 def test_built_in_network_conservation_and_short_experiments():

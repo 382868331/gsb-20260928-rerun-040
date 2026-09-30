@@ -29,8 +29,34 @@ def cmd_run(args: argparse.Namespace) -> None:
     else:
         model = load_model(args.model)
         runner = StochasticRunner(model, seed=args.seed)
-    runner.run(end_time=args.end_time, max_events=args.max_events)
-    validate_trajectory_conservation(runner.state)
+    try:
+        for time, encoded_rates in args.rate_change:
+            change_time = float(time)
+            try:
+                rate_constants = json.loads(encoded_rates)
+            except json.JSONDecodeError as exc:
+                runner.state.status = "failed"
+                runner.state.failed_at = change_time
+                runner.state.failure_reason = f"invalid rate-change JSON: {exc.msg}"
+                raise ValueError(runner.state.failure_reason) from exc
+            runner.schedule_rate_change(change_time, rate_constants)
+        runner.run(end_time=args.end_time, max_events=args.max_events)
+        validate_trajectory_conservation(runner.state)
+    except Exception:
+        if args.state:
+            save_state(runner.state, args.state)
+            print_json(
+                {
+                    "time": runner.state.time,
+                    "status": runner.state.status,
+                    "events": len(runner.state.events),
+                    "counts": runner.state.counts,
+                    "failed_at": runner.state.failed_at,
+                    "failure_reason": runner.state.failure_reason,
+                    "state_path": args.state,
+                }
+            )
+        raise SystemExit(1)
     if args.state:
         save_state(runner.state, args.state)
     print_json(
@@ -39,6 +65,9 @@ def cmd_run(args: argparse.Namespace) -> None:
             "status": runner.state.status,
             "events": len(runner.state.events),
             "counts": runner.state.counts,
+            "condition_changes": [change.to_dict() for change in runner.state.condition_changes],
+            "failed_at": runner.state.failed_at,
+            "failure_reason": runner.state.failure_reason,
             "conserved": conserved_quantities(runner.state.counts),
             "state_path": args.state,
         }
@@ -83,6 +112,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--seed", type=int, default=1)
     run_parser.add_argument("--end-time", type=float, required=True)
     run_parser.add_argument("--max-events", type=int)
+    run_parser.add_argument(
+        "--rate-change",
+        action="append",
+        nargs=2,
+        metavar=("TIME", "RATE_JSON"),
+        default=[],
+        help='schedule rate changes, for example: 2.5 \'{"bind": 0.3}\'',
+    )
     run_parser.set_defaults(func=cmd_run)
 
     batch_parser = subparsers.add_parser("experiments", help="compare many short random runs")

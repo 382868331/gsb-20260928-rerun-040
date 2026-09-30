@@ -19,8 +19,13 @@
 python -m biochem.cli init --model artifacts/model.json
 python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json --end-time 2
 python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json --end-time 5
+python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json --end-time 8 --rate-change 4 '{"bind":0.3}'
 python -m biochem.cli experiments --model artifacts/model.json --runs 50 --duration 5
 python -m biochem.cli deterministic --model artifacts/model.json --end-time 5 --step-size 0.05
 ```
 
-第一次 `run` 使用种子生成轨迹并保存随机数状态；第二次直接读取同一个状态继续。保存后重放或继续都会沿同一条随机轨迹，而不是只复用初始种子。每个事件都记录反应编号、发生时间、等待时间、被选倾向、总倾向、数量变化、选择原因和变化后数量。
+第一次 `run` 使用种子生成轨迹；每个可信边界都会立刻抽取并保存下一次反应的发生时刻、反应编号、等待时间、被选倾向和总倾向。因此即使保存点落在下一次反应到来之前，恢复后也不会重新抽取已经决定的等待或反应。第二次直接读取同一个状态继续。
+
+`--rate-change TIME RATE_JSON` 会把条件变更作为可重放输入记录在状态中。条件在指定时刻生效；若同一时刻已有反应，条件先生效，旧条件下抽中的未发生反应作废，并在新倾向下抽取后续等待。状态还会记录条件变更是否已应用。运行失败时会保留最后可信时间、数量、事件、随机数状态以及 `failed_at` 和 `failure_reason`。
+
+每个反应事件都记录反应编号、发生时间、等待时间、被选倾向、总倾向、数量变化、选择原因和变化后数量。
