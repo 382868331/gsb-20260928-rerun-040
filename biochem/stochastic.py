@@ -21,6 +21,7 @@ class ReactionEvent:
     reason: str
     counts_after: dict[str, int]
     condition_version: int = 0
+    waiting_created: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -37,6 +38,7 @@ class ReactionEvent:
             reason=str(data["reason"]),
             counts_after={str(k): int(v) for k, v in data["counts_after"].items()},
             condition_version=int(data.get("condition_version", 0)),
+            waiting_created=tuple(dict(item) for item in data.get("waiting_created", ())),
         )
 
 
@@ -76,6 +78,68 @@ class ConditionChange:
         )
 
 
+@dataclass(frozen=True)
+class WaitingItem:
+    """A concrete batch of molecules held outside the free pool until release."""
+
+    release_id: int
+    reaction_id: str
+    species_id: str
+    amount: int
+    created_time: float
+    release_time: float
+    created_version: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "WaitingItem":
+        return cls(
+            release_id=int(data["release_id"]),
+            reaction_id=str(data["reaction_id"]),
+            species_id=str(data["species_id"]),
+            amount=int(data["amount"]),
+            created_time=float(data["created_time"]),
+            release_time=float(data["release_time"]),
+            created_version=int(data.get("created_version", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class ReleaseEvent:
+    """A waiting batch entering the free pool at its scheduled instant."""
+
+    time: float
+    release_id: int
+    reaction_id: str
+    species_id: str
+    amount: int
+    reason: str
+    counts_after: dict[str, int]
+    waiting_after: dict[str, int]
+    condition_version: int = 0
+    created_version: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ReleaseEvent":
+        return cls(
+            time=float(data["time"]),
+            release_id=int(data["release_id"]),
+            reaction_id=str(data["reaction_id"]),
+            species_id=str(data["species_id"]),
+            amount=int(data["amount"]),
+            reason=str(data["reason"]),
+            counts_after={str(k): int(v) for k, v in data["counts_after"].items()},
+            waiting_after={str(k): int(v) for k, v in data["waiting_after"].items()},
+            condition_version=int(data.get("condition_version", 0)),
+            created_version=int(data.get("created_version", 0)),
+        )
+
+
 @dataclass
 class TrajectoryState:
     model: ExperimentModel
@@ -89,6 +153,9 @@ class TrajectoryState:
     condition_events: list[ConditionChange] = field(default_factory=list)
     condition_version: int = 0
     failure_reason: str | None = None
+    waiting: list[WaitingItem] = field(default_factory=list)
+    release_events: list[ReleaseEvent] = field(default_factory=list)
+    next_release_id: int = 0
 
     def __post_init__(self) -> None:
         complete_counts = {species.id: 0 for species in self.model.species}
@@ -113,6 +180,9 @@ class TrajectoryState:
             "condition_events": [change.to_dict() for change in self.condition_events],
             "condition_version": self.condition_version,
             "failure_reason": self.failure_reason,
+            "waiting": [item.to_dict() for item in self.waiting],
+            "release_events": [item.to_dict() for item in self.release_events],
+            "next_release_id": self.next_release_id,
             "model": self.model.to_dict(),
         }
 
@@ -139,6 +209,11 @@ class TrajectoryState:
             ],
             condition_version=int(data.get("condition_version", 0)),
             failure_reason=data.get("failure_reason"),
+            waiting=[WaitingItem.from_dict(item) for item in data.get("waiting", [])],
+            release_events=[
+                ReleaseEvent.from_dict(item) for item in data.get("release_events", [])
+            ],
+            next_release_id=int(data.get("next_release_id", 0)),
         )
 
     def fork(self) -> "TrajectoryState":
@@ -211,6 +286,68 @@ class StochasticRunner:
     def _next_condition_change(self) -> ConditionChange | None:
         return self.state.condition_schedule[0] if self.state.condition_schedule else None
 
+    def _waiting_totals(self) -> dict[str, int]:
+        totals = {species.id: 0 for species in self.model.species}
+        for item in self.state.waiting:
+            totals[item.species_id] = totals.get(item.species_id, 0) + item.amount
+        return totals
+
+    def _next_release_time(self) -> float | None:
+        return self.state.waiting[0].release_time if self.state.waiting else None
+
+    def _apply_due_releases(self, allow_equal: bool = True) -> list[ReleaseEvent]:
+        """Move every waiting batch due at the current time into the free pool.
+
+        Releases tied with the current time are applied before a stochastic
+        event or condition change tied with that same instant; the molecules
+        of a batch that already started waiting are unaffected by later rate
+        changes and keep their scheduled release time and identity.
+        """
+
+        def reached(item: WaitingItem) -> bool:
+            return item.release_time < self.state.time or (
+                allow_equal and item.release_time == self.state.time
+            )
+
+        due = [item for item in self.state.waiting if reached(item)]
+        if not due:
+            return []
+        # Identity order: same-instant batches release in creation order so
+        # branches and save points replay identical release sequences.
+        due.sort(key=lambda item: (item.release_time, item.release_id))
+        applied: list[ReleaseEvent] = []
+        remaining = {item.release_id: item for item in self.state.waiting}
+        for item in due:
+            self.state.time = item.release_time
+            self.state.counts[item.species_id] = (
+                self.state.counts.get(item.species_id, 0) + item.amount
+            )
+            del remaining[item.release_id]
+            self.state.waiting = sorted(
+                remaining.values(), key=lambda entry: (entry.release_time, entry.release_id)
+            )
+            reason = (
+                f"scheduled release of waiting batch {item.release_id} from reaction "
+                f"{item.reaction_id}; batch created at t={item.created_time:.12g} under "
+                f"condition_version={item.created_version}; released under "
+                f"condition_version={self.state.condition_version}"
+            )
+            release = ReleaseEvent(
+                time=item.release_time,
+                release_id=item.release_id,
+                reaction_id=item.reaction_id,
+                species_id=item.species_id,
+                amount=item.amount,
+                reason=reason,
+                counts_after=dict(self.state.counts),
+                waiting_after=self._waiting_totals(),
+                condition_version=self.state.condition_version,
+                created_version=item.created_version,
+            )
+            self.state.release_events.append(release)
+            applied.append(release)
+        return applied
+
     def _apply_due_condition_changes(self, allow_equal: bool = True) -> None:
         """Apply scheduled changes at or before the current trajectory time.
 
@@ -223,6 +360,7 @@ class StochasticRunner:
             return change.time < self.state.time or (
                 allow_equal and change.time == self.state.time
             )
+
 
         due = [
             change for change in self.state.condition_schedule if reached(change)
@@ -261,6 +399,10 @@ class StochasticRunner:
                 products=dict(reaction.products),
                 rate_constant=rate_constants[reaction.id],
                 name=reaction.name,
+                delayed_products={
+                    species_id: (amount, delay)
+                    for species_id, (amount, delay) in reaction.delayed_products.items()
+                },
             )
             for reaction in self.model.reactions
         )
@@ -291,11 +433,22 @@ class StochasticRunner:
                 (int(before[0]), tuple(int(v) for v in before[1]), before[2])
             )
 
-    def step(self) -> ReactionEvent | None:
+    def step(self) -> ReactionEvent | ReleaseEvent | None:
         if self.state.pending_event is not None:
             pending = self.state.pending_event
             next_change = self._next_condition_change()
-            if next_change is not None and next_change.time < float(pending["time"]):
+            pending_time = float(pending["time"])
+            next_release = self._next_release_time()
+            # Any waiting batch due no later than the stored tentative event
+            # invalidates that draw: release first, then redraw afterwards.
+            if next_release is not None and next_release <= pending_time:
+                self.state.pending_event = None
+                self._discard_pending_event(pending)
+                self.state.time = next_release
+                releases = self._apply_due_releases(allow_equal=True)
+                self._apply_due_condition_changes(allow_equal=True)
+                return releases[0]
+            if next_change is not None and next_change.time < pending_time:
                 # A condition now intervenes before the stored pre-drawn event.
                 # Discard that draw and its random numbers, then redraw under
                 # the new version so resume matches a continuous run.
@@ -321,9 +474,15 @@ class StochasticRunner:
             )
 
         self._apply_due_condition_changes(allow_equal=False)
+        next_release = self._next_release_time()
         rng = self._rng()
         available, propensities, total = self._available()
         if total <= 0.0:
+            if next_release is not None:
+                self.state.time = next_release
+                releases = self._apply_due_releases(allow_equal=True)
+                self._apply_due_condition_changes(allow_equal=True)
+                return releases[0]
             self.state.rng_state = rng.getstate()
             self.state.status = "exhausted"
             return None
@@ -343,6 +502,14 @@ class StochasticRunner:
         if not self.rule.is_possible(selected, self.state.counts):
             raise RuntimeError(f"rule selected impossible reaction {selected.id}")
 
+        if next_release is not None and next_release <= self.state.time + waiting_time:
+            # A release precedes (or ties with) the tentative reaction:
+            # discard the draw and its random numbers, release first.
+            self.state.time = next_release
+            releases = self._apply_due_releases(allow_equal=True)
+            self._apply_due_condition_changes(allow_equal=True)
+            return releases[0]
+
         event = self._build_event(
             selected,
             self.state.time + waiting_time,
@@ -351,11 +518,40 @@ class StochasticRunner:
             total,
             self.state.condition_version,
             self._event_reason(propensities[selected.id], total),
-        )
+        )[0]
         self.state.rng_state = rng.getstate()
         applied = self._apply_built_event(event)
         self._apply_due_condition_changes(allow_equal=True)
         return applied
+
+    def _make_waiting_items(
+        self,
+        selected: Reaction,
+        event_time: float,
+        descriptors: list[dict[str, Any]] | None = None,
+    ) -> list[WaitingItem]:
+        items: list[WaitingItem] = []
+        if descriptors is None:
+            descriptors = [
+                {"species_id": species_id, "amount": amount, "delay": delay}
+                for species_id, (amount, delay) in selected.delayed_products.items()
+            ]
+        for descriptor in descriptors:
+            species_id = str(descriptor["species_id"])
+            amount = int(descriptor["amount"])
+            delay = float(descriptor["delay"])
+            item = WaitingItem(
+                release_id=self.state.next_release_id,
+                reaction_id=selected.id,
+                species_id=species_id,
+                amount=amount,
+                created_time=event_time,
+                release_time=event_time + delay,
+                created_version=self.state.condition_version,
+            )
+            self.state.next_release_id += 1
+            items.append(item)
+        return items
 
     def _build_event(
         self,
@@ -366,14 +562,31 @@ class StochasticRunner:
         total_propensity: float,
         condition_version: int,
         reason: str,
-    ) -> ReactionEvent:
+    ) -> tuple[ReactionEvent, list[WaitingItem]]:
         if not self.rule.is_possible(selected, self.state.counts):
             raise RuntimeError(f"rule selected impossible reaction {selected.id}")
-        changes = selected.stoichiometry
+        changes = selected.initiation_stoichiometry
         new_counts = dict(self.state.counts)
         for species_id, change in changes.items():
             new_counts[species_id] = new_counts.get(species_id, 0) + change
-        return ReactionEvent(
+        descriptors = [
+            {
+                "species_id": species_id,
+                "amount": amount,
+                "delay": delay,
+            }
+            for species_id, (amount, delay) in selected.delayed_products.items()
+        ]
+        if descriptors:
+            reason = (
+                f"{reason}; {len(descriptors)} waiting batch(es) scheduled: "
+                + ", ".join(
+                    f"{int(descriptor['amount'])}x{descriptor['species_id']}@"
+                    f"{event_time + float(descriptor['delay']):.12g}"
+                    for descriptor in descriptors
+                )
+            )
+        event = ReactionEvent(
             time=event_time,
             reaction_id=selected.id,
             waiting_time=waiting_time,
@@ -383,11 +596,20 @@ class StochasticRunner:
             reason=reason,
             counts_after=new_counts,
             condition_version=condition_version,
+            waiting_created=tuple(descriptors),
         )
+        return event, []
 
     def _apply_built_event(self, event: ReactionEvent) -> ReactionEvent:
         self.state.time = event.time
         self.state.counts = dict(event.counts_after)
+        waiting_items = self._make_waiting_items(
+            self.model.reaction(event.reaction_id),
+            event.time,
+            list(event.waiting_created),
+        )
+        self.state.waiting.extend(waiting_items)
+        self.state.waiting.sort(key=lambda item: (item.release_time, item.release_id))
         self.state.events.append(event)
         self.state.status = "running"
         return event
@@ -402,7 +624,7 @@ class StochasticRunner:
         condition_version: int,
         reason: str,
     ) -> ReactionEvent:
-        event = self._build_event(
+        built = self._build_event(
             selected,
             event_time,
             waiting_time,
@@ -411,6 +633,8 @@ class StochasticRunner:
             condition_version,
             reason,
         )
+        event, built_items = built
+        assert not built_items
         applied = self._apply_built_event(event)
         self._apply_due_condition_changes(allow_equal=True)
         return applied
@@ -429,17 +653,16 @@ class StochasticRunner:
             if cutoff <= cumulative:
                 selected = candidate
                 break
-        return self._build_event(
+        event, _ = self._build_event(
             selected,
             self.state.time + waiting_time,
             waiting_time,
             propensities[selected.id],
             total,
             self.state.condition_version,
-            (
-                self._event_reason(propensities[selected.id], total)
-            ),
+            self._event_reason(propensities[selected.id], total),
         )
+        return event
 
     def run(
         self,
@@ -451,55 +674,109 @@ class StochasticRunner:
         events_used = 0
         try:
             while max_events is None or events_used < max_events:
-                if self.state.pending_event is not None:
-                    pending = self.state.pending_event
-                    pending_time = float(self.state.pending_event["time"])
-                    next_change = self._next_condition_change()
-                    if next_change is not None and next_change.time < pending_time:
-                        # A condition intervenes before the pre-drawn event:
-                        # discard it together with its consumed random draws.
-                        self.state.pending_event = None
-                        self._discard_pending_event(pending)
-                        if end_time is not None and end_time <= next_change.time:
-                            self.state.time = end_time
-                            self._apply_due_condition_changes(allow_equal=True)
-                            self.state.status = "time_limit"
-                            break
-                        self.state.time = next_change.time
-                        self._apply_due_condition_changes(allow_equal=True)
-                        continue
-                    if end_time is not None and pending_time > end_time:
-                        self.state.time = end_time
-                        self.state.status = "time_limit"
-                        break
-                    self._apply_due_condition_changes(allow_equal=False)
-                    self.step()
-                    events_used += 1
-                    continue
-
                 self._apply_due_condition_changes(allow_equal=False)
+                # When a run is capped exactly on a boundary, complete every
+                # release and condition declaration tied with that instant.
+                if end_time is not None and self.state.time == end_time:
+                    self._apply_due_releases(allow_equal=True)
+                    self._apply_due_condition_changes(allow_equal=True)
                 if end_time is not None and self.state.time >= end_time:
                     self.state.status = "time_limit"
                     break
 
                 next_change = self._next_condition_change()
+                next_release = self._next_release_time()
+
+                if self.state.pending_event is not None:
+                    pending = self.state.pending_event
+                    pending_time = float(pending["time"])
+                    intervening_release = (
+                        next_release is not None and next_release <= pending_time
+                    )
+                    intervening_change = (
+                        next_change is not None and next_change.time < pending_time
+                    )
+                    if intervening_release or intervening_change:
+                        self.state.pending_event = None
+                        self._discard_pending_event(pending)
+                        if intervening_release and (
+                            intervening_change is False
+                            or (next_release is not None and next_release <= next_change.time)
+                        ):
+                            boundary = next_release
+                            if end_time is not None and end_time <= boundary:
+                                self.state.time = end_time
+                                self._apply_due_releases(allow_equal=True)
+                                self._apply_due_condition_changes(allow_equal=True)
+                                self.state.status = "time_limit"
+                                break
+                            self.state.time = boundary
+                            self._apply_due_releases(allow_equal=True)
+                        else:
+                            if end_time is not None and end_time <= next_change.time:
+                                self.state.time = end_time
+                                self._apply_due_condition_changes(allow_equal=True)
+                                self.state.status = "time_limit"
+                                break
+                            self.state.time = next_change.time
+                            self._apply_due_condition_changes(allow_equal=True)
+                        continue
+                    if end_time is not None and pending_time > end_time:
+                        self.state.time = end_time
+                        # Releases due exactly at the end instant still happen;
+                        # they complete before the run is capped; a condition
+                        # declared for that same instant then takes effect too.
+                        self._apply_due_releases(allow_equal=True)
+                        self._apply_due_condition_changes(allow_equal=True)
+                        self.state.status = "time_limit"
+                        break
+                    self._apply_due_releases(allow_equal=False)
+                    self.step()
+                    events_used += 1
+                    continue
+
                 rng_state_before = self.state.rng_state
                 rng = self._rng()
                 event = self._draw_event(rng)
                 if event is None:
+                    # No stochastic event is possible, but waiting batches may
+                    # still release material that enables later reactions.
+                    if next_release is not None and (
+                        end_time is None or next_release <= end_time
+                    ):
+                        self.state.rng_state = rng.getstate()
+                        self.state.time = next_release
+                        self._apply_due_releases(allow_equal=True)
+                        continue
                     self.state.rng_state = rng.getstate()
                     self.state.status = "exhausted"
                     break
 
-                if (
+                release_blocks = (
+                    next_release is not None
+                    and event.time >= next_release
+                    and (end_time is None or next_release <= end_time)
+                )
+                change_blocks = (
                     next_change is not None
                     and event.time > next_change.time
                     and (end_time is None or next_change.time <= end_time)
-                ):
-                    # Conditions change first: discard the tentative draw
-                    # without consuming random numbers and redraw afterwards.
-                    self.state.time = next_change.time
-                    self._apply_due_condition_changes(allow_equal=True)
+                )
+                if release_blocks or change_blocks:
+                    # A scheduled boundary precedes (or ties, for releases)
+                    # the tentative event: discard the draw without consuming
+                    # random numbers, advance to the boundary, then redraw.
+                    self.state.rng_state = rng_state_before
+                    use_release = release_blocks and (
+                        not change_blocks
+                        or (next_release is not None and next_release <= next_change.time)
+                    )
+                    if use_release:
+                        self.state.time = next_release
+                        self._apply_due_releases(allow_equal=True)
+                    else:
+                        self.state.time = next_change.time
+                        self._apply_due_condition_changes(allow_equal=True)
                     continue
 
                 if end_time is not None and event.time > end_time:
@@ -513,11 +790,19 @@ class StochasticRunner:
                         "waiting_time": event.waiting_time,
                         "propensity": event.propensity,
                         "total_propensity": event.total_propensity,
-                        "reason": event.reason,
+                        "reason": self._event_reason(
+                            event.propensity, event.total_propensity
+                        ),
                         "condition_version": event.condition_version,
+                        "waiting_created": [dict(item) for item in event.waiting_created],
                         "rng_state_before": self._serialize_rng_state(rng_state_before),
                     }
                     self.state.rng_state = rng.getstate()
+                    # A waiting batch due exactly at the end instant still
+                    # completes; it is applied before the run is capped so a
+                    # resume immediately after sees the released material.
+                    self._apply_due_releases(allow_equal=True)
+                    self._apply_due_condition_changes(allow_equal=True)
                     self.state.status = "time_limit"
                     break
 

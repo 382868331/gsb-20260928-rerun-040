@@ -7,9 +7,14 @@ import json
 import sys
 from pathlib import Path
 
-from .analysis import conserved_quantities, run_short_experiments, validate_trajectory_conservation
+from .analysis import (
+    material_balance,
+    run_short_experiments,
+    validate_trajectory_conservation,
+    waiting_quantities,
+)
 from .deterministic import rk4_scan
-from .models import build_conservation_network
+from .models import build_conservation_network, build_delayed_release_network
 from .persistence import load_model, load_state, save_model, save_state
 from .stochastic import StochasticRunner
 
@@ -42,8 +47,13 @@ def parse_condition(spec: str) -> tuple[float, dict[str, float]]:
 
 
 def cmd_init(args: argparse.Namespace) -> None:
-    save_model(build_conservation_network(), args.model)
-    print(f"saved built-in conservation model to {args.model}")
+    builder = (
+        build_delayed_release_network
+        if args.network == "delayed-release"
+        else build_conservation_network
+    )
+    save_model(builder(), args.model)
+    print(f"saved built-in {args.network} model to {args.model}")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -69,7 +79,14 @@ def cmd_run(args: argparse.Namespace) -> None:
             "status": runner.state.status,
             "events": len(runner.state.events),
             "counts": runner.state.counts,
-            "conserved": conserved_quantities(runner.state.counts),
+            "waiting": {
+                "items": [item.to_dict() for item in runner.state.waiting],
+                "totals": waiting_quantities(runner.state),
+            },
+            "release_events": [
+                release.to_dict() for release in runner.state.release_events
+            ],
+            "conserved": material_balance(runner.state),
             "condition_events": [
                 change.to_dict() for change in runner.state.condition_events
             ],
@@ -100,7 +117,12 @@ def cmd_deterministic(args: argparse.Namespace) -> None:
         {
             "rule": "continuous-mass-action-rk4",
             "points": [
-                {"time": point.time, "values": point.values} for point in points
+                {
+                    "time": point.time,
+                    "values": point.values,
+                    "waiting": point.waiting,
+                }
+                for point in points
             ],
         }
     )
@@ -112,6 +134,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_parser = subparsers.add_parser("init", help="write the built-in conservation network")
     init_parser.add_argument("--model", default="artifacts/model.json")
+    init_parser.add_argument(
+        "--network",
+        choices=("conservation", "delayed-release"),
+        default="conservation",
+    )
     init_parser.set_defaults(func=cmd_init)
 
     run_parser = subparsers.add_parser("run", help="run or resume one stochastic trajectory")
