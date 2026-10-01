@@ -13,6 +13,8 @@
 
 内置网络为 `E + S ↔ ES → E + P`。它有两条守恒关系：`E + ES` 守恒，`S + ES + P` 守恒。任一反应物数量不足时，对应倾向为零，反应不会发生。
 
+模型可在反应的 `product_delays` 中为产物声明正延迟，例如 `{"P": 1.0}` 表示反应事件发生时先扣减反应物，`P` 作为等待中的中间物记账；到预定时刻才加入 `counts`。每份等待产物都有唯一 `release_id`，记录其来源 `source_event_id`、数量、反应 ID、创建时间、预定释放时间和启动反应时的条件版本。等待中物不进入质量作用倾向，也不会在后续条件改变时消失或被改写。
+
 ## 使用
 
 ```bash
@@ -37,11 +39,13 @@ python -m biochem.cli deterministic --model artifacts/model.json --end-time 5 --
 python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json --end-time 5 --condition 2.0:catalyze=3.0
 ```
 
-`--condition TIME:REACTION=RATE` 可重复指定，同一 `TIME` 可给出多项变更。变更会作为可重放输入记录在状态的 `condition_schedule` 中，生效后写入 `condition_events`（含版本号与速率快照）；保存/恢复后按计划继续生效，分段与连续运行结果一致。若下一次抽取的事件会跨过变更时刻，该次试探性抽取连同随机数一并回滚，时间推进到变更点后用新条件重新抽取。
+`--condition TIME:REACTION=RATE` 可重复指定，同一 `TIME` 可给出多项变更。变更会作为可重放输入记录在状态的 `condition_schedule` 中，生效后写入 `condition_events`（含版本号与速率快照）；保存/恢复后按计划继续生效，分段与连续运行结果一致。若下一次抽取的事件会跨过变更时刻，该次试探性抽取连同随机数一并回滚，时间推进到变更点后用新条件重新抽取。已经启动的延迟产物只携带启动时的条件版本；后来改变速率只影响之后新抽取的反应，不改变已挂账产物的数量或释放时刻。释放事件的 `condition_version` 是启动版本，`release_condition_version` 记录释放当下版本。若释放与条件切换同刻，先按稳定的 `release_id` 顺序释放，再生效条件。
 
 ## 从检查点分出条件方案
 
-需要比较不同条件方案时，使用 `StochasticRunner.fork()`（或 `TrajectoryState.fork()`）从同一检查点深拷贝出独立分支。各分支拥有独立的事件列表、条件计划和随机数状态，互不共享后续随机流；在分支上分别 `schedule_condition_change` 后继续运行即可逐事件对比。
+需要比较不同条件方案时，使用 `StochasticRunner.fork()`（或 `TrajectoryState.fork()`）从同一检查点深拷贝出独立分支。各分支拥有独立的事件列表、条件计划和随机数状态，互不共享后续随机流；在分支上分别 `schedule_condition_change` 后继续运行即可逐事件对比。若要区分改变事件发生时刻还是尚未完成反应的释放时刻，可对分支调用 `reschedule_pending_release(release_id, scheduled_time)`；它只移动指定挂账，不改变源事件身份、数量或随机轨迹。
+
+状态 JSON 包含 `waiting_counts` 与 `pending_releases`。每个反应事件的 `waiting_after` 给出事件后等待库存，释放事件带 `event_type="release"`、`release_id` 和 `source_event_id`。分支深拷贝后可各自释放检查点上的同一份挂账，但任一分支内同一 `release_id` 只允许出现一次。守恒检查会把各物种的等待数量与同名自由物一并计入。
 
 ## 异常停止
 

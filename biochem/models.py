@@ -29,6 +29,7 @@ class Reaction:
     products: dict[str, int] = field(default_factory=dict)
     rate_constant: float = 1.0
     name: str = ""
+    product_delays: dict[str, float] = field(default_factory=dict)
 
     @property
     def stoichiometry(self) -> dict[str, int]:
@@ -45,6 +46,7 @@ class Reaction:
             "name": self.name or self.id,
             "reactants": dict(self.reactants),
             "products": dict(self.products),
+            "product_delays": dict(self.product_delays),
             "rate_constant": self.rate_constant,
         }
 
@@ -55,6 +57,9 @@ class Reaction:
             name=str(data.get("name", data["id"])),
             reactants={str(k): int(v) for k, v in data.get("reactants", {}).items()},
             products={str(k): int(v) for k, v in data.get("products", {}).items()},
+            product_delays={
+                str(k): float(v) for k, v in data.get("product_delays", {}).items()
+            },
             rate_constant=float(data.get("rate_constant", 1.0)),
         )
 
@@ -94,6 +99,11 @@ class ExperimentModel:
                         raise ValueError(f"{side_name} references unknown species {species_id}")
                     if amount <= 0:
                         raise ValueError(f"stoichiometry must be positive for {reaction.id}/{species_id}")
+            for species_id, delay in reaction.product_delays.items():
+                if species_id not in reaction.products:
+                    raise ValueError(f"delay for {reaction.id} references non-product {species_id}")
+                if delay <= 0:
+                    raise ValueError(f"product delay must be positive for {reaction.id}/{species_id}")
         for species_id, count in self.initial_counts.items():
             if species_id not in ids:
                 raise ValueError(f"initial count references unknown species {species_id}")

@@ -39,11 +39,17 @@ class ExperimentSummary:
 def conserved_quantities(
     counts: dict[str, int],
     groups: Iterable[tuple[str, tuple[str, ...]]] = CONSERVED_GROUPS,
+    waiting_counts: dict[str, int] | None = None,
 ) -> dict[str, int]:
-    return {
-        name: sum(counts.get(species_id, 0) for species_id in species_ids)
-        for name, species_ids in groups
-    }
+    waiting_counts = waiting_counts or {}
+    values: dict[str, int] = {}
+    for name, species_ids in groups:
+        total = 0
+        for species_id in species_ids:
+            total += counts.get(species_id, 0)
+            total += waiting_counts.get(species_id, 0)
+        values[name] = total
+    return values
 
 
 def validate_trajectory_conservation(
@@ -53,7 +59,12 @@ def validate_trajectory_conservation(
     expected = conserved_quantities(state.model.initial_counts, groups)
     checkpoints = [state.model.initial_counts] + [event.counts_after for event in state.events]
     for event_index, counts in enumerate(checkpoints):
-        actual = conserved_quantities(counts, groups)
+        waiting = (
+            state.events[event_index - 1].waiting_after
+            if event_index > 0
+            else {}
+        )
+        actual = conserved_quantities(counts, groups, waiting)
         if actual != expected:
             raise AssertionError(
                 f"conservation violated at event {event_index}: {actual} != {expected}"

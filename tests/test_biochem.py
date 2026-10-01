@@ -2,10 +2,10 @@ import json
 
 from biochem.analysis import run_short_experiments, validate_trajectory_conservation
 from biochem.deterministic import rk4_scan
-from biochem.models import Reaction, build_conservation_network
+from biochem.models import ExperimentModel, Reaction, Species, build_conservation_network
 from biochem.persistence import load_state, save_state
 from biochem.rules import MassActionRule
-from biochem.stochastic import StochasticRunner
+from biochem.stochastic import PendingRelease, StochasticRunner
 
 
 def test_insufficient_reactants_have_zero_propensity():
@@ -318,3 +318,178 @@ def test_branches_from_checkpoint_have_independent_random_state():
     assert not base.state.condition_events
     assert branch_a.state.condition_events[0].label == "boost"
     assert branch_b.state.condition_events[0].label == "suppress"
+
+
+def delayed_model(delay: float = 1.0) -> ExperimentModel:
+    species = tuple(Species(species_id) for species_id in ("E", "S", "ES", "P"))
+    reactions = (
+        Reaction("bind", {"E": 1, "S": 1}, {"ES": 1}, rate_constant=10.0),
+        Reaction(
+            "catalyze",
+            {"ES": 1},
+            {"E": 1, "P": 1},
+            rate_constant=10.0,
+            product_delays={"P": delay},
+        ),
+    )
+    return ExperimentModel(
+        species=species,
+        reactions=reactions,
+        initial_counts={"E": 1, "S": 3, "ES": 0, "P": 0},
+    )
+
+
+def test_delayed_product_has_identity_and_does_not_react_until_released():
+    runner = StochasticRunner(delayed_model(), seed=4)
+    state = runner.run(0.6)
+
+    source = next(event for event in state.events if event.reaction_id == "catalyze")
+    assert source.event_id == "event-000002"
+    assert state.waiting_counts["P"] == 3
+    assert sum(state.waiting_counts.values()) == 3
+    assert state.counts["P"] == 0
+    pending = state.pending_releases[0]
+    assert pending.release_id == "release-000001"
+    assert pending.source_event_id == source.event_id
+    assert pending.products == {"P": 1}
+    assert pending.condition_version == 0
+
+    runner.run(2)
+    release = next(event for event in state.events if event.event_type == "release")
+    assert release.release_id == pending.release_id
+    assert release.source_event_id == source.event_id
+    assert release.changes == {"P": 1}
+    assert state.counts["P"] == 3
+    assert state.waiting_counts["P"] == 0
+    assert state.pending_releases == []
+    validate_trajectory_conservation(state)
+
+
+def test_delayed_release_and_condition_share_instant_with_distinct_versions():
+    runner = StochasticRunner(delayed_model(0.4), seed=4)
+    state = runner.run(0.2)
+    source = next(event for event in state.events if event.reaction_id == "catalyze")
+    release_time = source.time + 0.4
+    pending_release = next(
+        release for release in state.pending_releases
+        if release.scheduled_time == release_time
+    )
+    runner.schedule_condition_change(release_time, {"catalyze": 100.0})
+
+    runner.run(release_time)
+    release = next(
+        event for event in state.events
+        if event.event_type == "release" and event.release_id == pending_release.release_id
+    )
+    assert release.time == release_time
+    assert release.condition_version == 0
+    assert release.release_condition_version == 1
+    assert state.condition_events[0].version == 1
+    assert state.condition_version == 1
+    runner.run(2)
+    later_reactions = [
+        event for event in state.events
+        if event.event_type == "reaction" and event.time > release_time
+    ]
+    assert all(event.condition_version == 1 for event in later_reactions)
+    validate_trajectory_conservation(state)
+
+
+def test_checkpoints_around_multiple_simultaneous_releases_match_continuous(tmp_path):
+    continuous = StochasticRunner(delayed_model(0.5), seed=8)
+    continuous.run(3)
+    source_events = [
+        event for event in continuous.state.events if event.reaction_id == "catalyze"
+    ]
+    assert len(source_events) >= 2
+    release_time = source_events[0].time + 0.5
+    simultaneous = [
+        event for event in continuous.state.events
+        if event.event_type == "release" and event.time == release_time
+    ]
+    assert len(simultaneous) >= 1
+
+    for index, checkpoint_time in enumerate(
+        (release_time - 0.01, release_time, release_time + 0.01)
+    ):
+        runner = StochasticRunner(delayed_model(0.5), seed=8)
+        runner.run(checkpoint_time)
+        path = tmp_path / f"delay-{index}.json"
+        save_state(runner.state, path)
+        resumed = StochasticRunner.from_state(load_state(path))
+        resumed.run(3)
+        assert event_dicts(resumed.state) == event_dicts(continuous.state)
+        assert resumed.state.waiting_counts == continuous.state.waiting_counts
+
+    release_ids = [event.release_id for event in continuous.state.events if event.event_type == "release"]
+    assert len(release_ids) == len(set(release_ids))
+
+
+def test_multiple_releases_at_same_time_apply_each_identity_once():
+    runner = StochasticRunner(delayed_model(), seed=1)
+    runner.state.time = 0.5
+    runner.state.counts = {"E": 0, "S": 0, "ES": 0, "P": 0}
+    runner.state.waiting_counts = {"E": 0, "S": 0, "ES": 0, "P": 2}
+    runner.state.pending_releases = [
+        PendingRelease(
+            release_id="release-000002",
+            source_event_id="event-000002",
+            reaction_id="catalyze",
+            products={"P": 1},
+            created_time=0.0,
+            scheduled_time=1.0,
+            condition_version=0,
+        ),
+        PendingRelease(
+            release_id="release-000001",
+            source_event_id="event-000001",
+            reaction_id="catalyze",
+            products={"P": 1},
+            created_time=0.0,
+            scheduled_time=1.0,
+            condition_version=0,
+        ),
+    ]
+    runner.state.pending_releases.sort(key=lambda release: (release.scheduled_time, release.release_id))
+
+    runner.run(1.0)
+
+    releases = [event for event in runner.state.events if event.event_type == "release"]
+    assert [event.release_id for event in releases] == [
+        "release-000001",
+        "release-000002",
+    ]
+    assert [event.source_event_id for event in releases] == [
+        "event-000001",
+        "event-000002",
+    ]
+    assert runner.state.counts["P"] == 2
+    assert runner.state.waiting_counts["P"] == 0
+    assert runner.state.pending_releases == []
+
+
+def test_branches_can_change_only_a_pending_release_time():
+    base_runner = StochasticRunner(delayed_model(1.0), seed=4)
+    base_runner.run(0.6)
+    source = next(
+        event for event in base_runner.state.events if event.reaction_id == "catalyze"
+    )
+    original_time = source.time + 1.0
+
+    early = base_runner.fork()
+    late = base_runner.fork()
+    pending_id = early.state.pending_releases[0].release_id
+    early.reschedule_pending_release(pending_id, original_time - 0.4)
+    late.reschedule_pending_release(pending_id, original_time + 0.4)
+    early.run(3)
+    late.run(3)
+
+    early_release = next(event for event in early.state.events if event.release_id == pending_id)
+    late_release = next(event for event in late.state.events if event.release_id == pending_id)
+    assert early_release.time == original_time - 0.4
+    assert late_release.time == original_time + 0.4
+    assert early_release.source_event_id == source.event_id
+    assert late_release.source_event_id == source.event_id
+    assert early.state.counts["P"] == late.state.counts["P"]
+    validate_trajectory_conservation(early.state)
+    validate_trajectory_conservation(late.state)

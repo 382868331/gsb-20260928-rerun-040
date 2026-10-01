@@ -69,7 +69,14 @@ def cmd_run(args: argparse.Namespace) -> None:
             "status": runner.state.status,
             "events": len(runner.state.events),
             "counts": runner.state.counts,
-            "conserved": conserved_quantities(runner.state.counts),
+            "waiting_counts": runner.state.waiting_counts,
+            "pending_releases": [
+                release.to_dict() for release in runner.state.pending_releases
+            ],
+            "conserved": conserved_quantities(
+                runner.state.counts,
+                waiting_counts=runner.state.waiting_counts,
+            ),
             "condition_events": [
                 change.to_dict() for change in runner.state.condition_events
             ],
