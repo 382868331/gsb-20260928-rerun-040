@@ -5,7 +5,7 @@ from biochem.deterministic import rk4_scan
 from biochem.models import ExperimentModel, Reaction, Species, build_conservation_network
 from biochem.persistence import load_state, save_state
 from biochem.rules import MassActionRule
-from biochem.stochastic import PendingRelease, StochasticRunner
+from biochem.stochastic import PendingRelease, ReleaseGate, StochasticRunner, WaitingTransfer
 
 
 def test_insufficient_reactants_have_zero_propensity():
@@ -493,3 +493,132 @@ def test_branches_can_change_only_a_pending_release_time():
     assert early.state.counts["P"] == late.state.counts["P"]
     validate_trajectory_conservation(early.state)
     validate_trajectory_conservation(late.state)
+
+
+def competing_lot_model() -> ExperimentModel:
+    species = tuple(Species(species_id) for species_id in ("E", "P"))
+    reaction = Reaction("make", {"E": 1}, {"E": 1, "P": 1}, rate_constant=0.0)
+    return ExperimentModel(
+        species=species,
+        reactions=(reaction,),
+        initial_counts={"E": 1, "P": 6},
+    )
+
+
+def runner_with_three_waiting() -> StochasticRunner:
+    runner = StochasticRunner(competing_lot_model(), seed=1)
+    runner.state.time = 0.5
+    runner.state.counts = {"E": 1, "P": 3}
+    runner.state.waiting_counts = {"E": 0, "P": 3}
+    runner.state.pending_releases = [
+        PendingRelease(
+            release_id="release-000001",
+            source_event_id="event-000001",
+            reaction_id="make",
+            products={"P": 3},
+            created_time=0.0,
+            scheduled_time=2.0,
+            condition_version=0,
+        )
+    ]
+    return runner
+
+
+def test_waiting_intermediates_have_competing_traced_destinations():
+    runner = runner_with_three_waiting()
+    runner.schedule_release_gate(1.0, False, label="hold")
+    runner.schedule_waiting_transfer(1.0, "release-000001", "inactivated", 1)
+    runner.schedule_waiting_transfer(1.0, "release-000001", "sequestered", 1)
+    runner.schedule_release_gate(2.5, True, label="resume")
+
+    runner.run(2.5)
+
+    assert runner.state.time == 2.5
+    assert runner.state.counts["P"] == 4
+    assert runner.state.waiting_counts["P"] == 0
+    assert runner.state.inactivated_counts["P"] == 1
+    assert runner.state.sequestered_counts["P"] == 1
+    event_types = [event.event_type for event in runner.state.events]
+    assert event_types == [
+        "release_gate",
+        "waiting_transfer",
+        "waiting_transfer",
+        "release_gate",
+        "release",
+    ]
+    release = runner.state.events[-1]
+    assert release.time == 2.5
+    assert release.source_event_id == "event-000001"
+    assert release.root_release_id == "release-000001"
+    assert release.changes == {"P": 1}
+    validate_trajectory_conservation(runner.state)
+
+
+def test_blocking_release_does_not_destroy_or_double_release_after_resume(tmp_path):
+    continuous = runner_with_three_waiting()
+    continuous.schedule_release_gate(1.5, False)
+    continuous.schedule_release_gate(2.5, True)
+    continuous.run(3.0)
+
+    runner = runner_with_three_waiting()
+    runner.schedule_release_gate(1.5, False)
+    runner.schedule_release_gate(2.5, True)
+    for checkpoint_time in (1.0, 1.5, 2.0, 2.5, 3.0):
+        split = runner.fork()
+        split.run(checkpoint_time)
+        path = tmp_path / f"state-{checkpoint_time}.json"
+        save_state(split.state, path)
+        resumed = StochasticRunner.from_state(load_state(path))
+        resumed.run(3.0)
+        assert event_dicts(resumed.state) == event_dicts(continuous.state)
+
+    release_events = [event for event in continuous.state.events if event.event_type == "release"]
+    assert len(release_events) == 1
+    assert release_events[0].time == 2.5
+    assert all(count >= 0 for count in continuous.state.waiting_counts.values())
+
+
+def test_sequestered_fragment_requires_explicit_return_then_release():
+    runner = runner_with_three_waiting()
+    runner.schedule_waiting_transfer(1.0, "release-000001", "sequestered", 1)
+    runner.run(2.5)
+
+    assert runner.state.counts["P"] == 5
+    assert runner.state.sequestered_counts["P"] == 1
+    sequestered = next(item for item in runner.state.pending_releases if item.status == "sequestered")
+    assert sequestered.root_id == "release-000001"
+
+    runner.schedule_waiting_transfer(3.0, sequestered.release_id, "waiting", 1)
+    runner.run(3.5)
+
+    assert runner.state.counts["P"] == 6
+    assert runner.state.sequestered_counts["P"] == 0
+    assert runner.state.waiting_counts["P"] == 0
+    releases = [event for event in runner.state.events if event.event_type == "release"]
+    assert len(releases) == 2
+    assert [event.source_event_id for event in releases] == ["event-000001", "event-000001"]
+    assert len({event.release_id for event in releases}) == 2
+    validate_trajectory_conservation(runner.state)
+
+
+def test_competing_policy_plans_are_branch_local_and_replayable(tmp_path):
+    base = runner_with_three_waiting()
+    base.run(0.75)
+    allow_branch = base.fork()
+    blocked_branch = base.fork()
+    blocked_branch.schedule_release_gate(2.0, False)
+    blocked_branch.schedule_release_gate(3.0, True)
+    allow_branch.run(3)
+    blocked_branch.run(3)
+
+    assert allow_branch.state.counts["P"] == 6
+    assert blocked_branch.state.counts["P"] == 6
+    assert allow_branch.state.events[-1].time == 2.0
+    assert blocked_branch.state.events[-1].time == 3.0
+    assert base.state.pending_releases[0].scheduled_time == 2.0
+    assert not base.state.gate_events
+
+    save_state(blocked_branch.state, tmp_path / "blocked.json")
+    restored = StochasticRunner.from_state(load_state(tmp_path / "blocked.json"))
+    assert restored.state.gate_events == blocked_branch.state.gate_events
+    assert restored.state.pending_releases == blocked_branch.state.pending_releases

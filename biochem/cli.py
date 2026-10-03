@@ -41,6 +41,34 @@ def parse_condition(spec: str) -> tuple[float, dict[str, float]]:
     return time_value, rate_constants
 
 
+def parse_gate(spec: str) -> tuple[float, bool]:
+    try:
+        time_text, value_text = spec.split(":", 1)
+        time_value = float(time_text)
+        value = value_text.strip().lower() in {"1", "true", "yes", "on", "allow", "allowed"}
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid release gate {spec!r}; expected TIME:true|false"
+        ) from None
+    return time_value, value
+
+
+def parse_waiting_transfer(spec: str) -> tuple[float, str, str, int]:
+    try:
+        time_text, assignment = spec.split(":", 1)
+        time_value = float(time_text)
+        release_id, destination_amount = assignment.split("=", 1)
+        destination, amount_text = destination_amount.split(":", 1)
+        amount = int(amount_text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid waiting transfer {spec!r}; expected TIME:RELEASE_ID=DESTINATION:AMOUNT"
+        ) from None
+    if destination not in {"waiting", "inactivated", "sequestered", "free"}:
+        raise argparse.ArgumentTypeError(f"invalid waiting destination {destination!r}")
+    return time_value, release_id.strip(), destination, amount
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     save_model(build_conservation_network(), args.model)
     print(f"saved built-in conservation model to {args.model}")
@@ -55,6 +83,12 @@ def cmd_run(args: argparse.Namespace) -> None:
         runner = StochasticRunner(model, seed=args.seed)
     for time_value, rate_constants in args.condition or []:
         runner.schedule_condition_change(time_value, rate_constants, label="cli")
+    for time_value, allowed in args.release_gate or []:
+        runner.schedule_release_gate(time_value, allowed, label="cli")
+    for time_value, release_id, destination, amount in args.waiting_transfer or []:
+        runner.schedule_waiting_transfer(
+            time_value, release_id, destination, amount, label="cli"
+        )
     failure = None
     try:
         runner.run(end_time=args.end_time, max_events=args.max_events)
@@ -70,17 +104,23 @@ def cmd_run(args: argparse.Namespace) -> None:
             "events": len(runner.state.events),
             "counts": runner.state.counts,
             "waiting_counts": runner.state.waiting_counts,
+            "inactivated_counts": runner.state.inactivated_counts,
+            "sequestered_counts": runner.state.sequestered_counts,
             "pending_releases": [
                 release.to_dict() for release in runner.state.pending_releases
             ],
             "conserved": conserved_quantities(
                 runner.state.counts,
                 waiting_counts=runner.state.waiting_counts,
+                inactivated_counts=runner.state.inactivated_counts,
+                sequestered_counts=runner.state.sequestered_counts,
             ),
             "condition_events": [
                 change.to_dict() for change in runner.state.condition_events
             ],
             "condition_version": runner.state.condition_version,
+            "release_allowed": runner.state.release_allowed,
+            "gate_version": runner.state.gate_version,
             "failure_reason": failure or runner.state.failure_reason,
             "state_path": args.state,
         }
@@ -133,6 +173,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_condition,
         metavar="TIME:REACTION=RATE",
         help="schedule a replayable rate change, e.g. 2.5:catalyze=0.5",
+    )
+    run_parser.add_argument(
+        "--release-gate",
+        action="append",
+        type=parse_gate,
+        metavar="TIME:true|false",
+        help="allow or temporarily block waiting intermediates from releasing",
+    )
+    run_parser.add_argument(
+        "--waiting-transfer",
+        action="append",
+        type=parse_waiting_transfer,
+        metavar="TIME:RELEASE_ID=DESTINATION:AMOUNT",
+        help="move waiting intermediates to waiting, inactivated, sequestered, or free",
     )
     run_parser.set_defaults(func=cmd_run)
 

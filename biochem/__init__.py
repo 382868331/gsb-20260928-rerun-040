@@ -2,14 +2,17 @@
 
 from .models import ExperimentModel, Reaction, Species
 from .rules import MassActionRule, ReactionRule
-from .stochastic import StochasticRunner, TrajectoryState
+from .stochastic import PendingRelease, ReleaseGate, StochasticRunner, TrajectoryState, WaitingTransfer
 
 __all__ = [
     "ExperimentModel",
     "MassActionRule",
+    "PendingRelease",
     "Reaction",
+    "ReleaseGate",
     "ReactionRule",
     "Species",
     "StochasticRunner",
     "TrajectoryState",
+    "WaitingTransfer",
 ]
