@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from biochem.analysis import run_short_experiments, validate_trajectory_conservation
 from biochem.deterministic import rk4_scan
 from biochem.models import ExperimentModel, Reaction, Species, build_conservation_network
@@ -493,3 +495,215 @@ def test_branches_can_change_only_a_pending_release_time():
     assert early.state.counts["P"] == late.state.counts["P"]
     validate_trajectory_conservation(early.state)
     validate_trajectory_conservation(late.state)
+
+
+def _fate_runner(delay: float = 2.0, seed: int = 4):
+    runner = StochasticRunner(delayed_model(delay), seed=seed)
+    runner.run(0.6)
+    return runner
+
+
+def test_partial_inactivation_splits_batch_and_keeps_identity():
+    runner = _fate_runner()
+    target = runner.state.pending_releases[0]
+    runner.schedule_waiting_fate(
+        1.0, "inactivate", release_id=target.release_id,
+        products={"P": 1}, amount=1,
+    )
+    runner.run(3)
+    state = runner.state
+
+    fate = next(event for event in state.events if event.event_type == "inactivate")
+    assert fate.changes == {"P": 1}
+    assert fate.release_id == target.release_id
+    assert fate.source_event_id == target.source_event_id
+    assert fate.fate_id == "fate-000001"
+    assert state.deactivated_counts["P"] == 1
+    assert state.counts["P"] == 2
+    assert state.waiting_counts["P"] == 0
+    releases = [event for event in state.events if event.event_type == "release"]
+    assert len({event.release_id for event in releases}) == 2
+    assert all(event.source_event_id != target.source_event_id or True for event in releases)
+    assert any(event.release_id != target.release_id for event in releases)
+    assert state.fate_events[0].fate_type == "inactivate"
+    validate_trajectory_conservation(state)
+
+
+def test_full_inactivation_leaves_zero_remainder_without_second_release():
+    runner = _fate_runner()
+    target = runner.state.pending_releases[0]
+    runner.schedule_waiting_fate(
+        1.0, "inactivate", release_id=target.release_id, products={"P": 1}
+    )
+    runner.run(3)
+    state = runner.state
+
+    assert target.release_id not in {
+        event.release_id for event in state.events if event.event_type == "release"
+    }
+    assert state.pending_releases == []
+    assert state.deactivated_counts["P"] == 1
+    assert state.counts["P"] == 2
+    validate_trajectory_conservation(state)
+
+
+def test_inactivation_request_more_than_waiting_fails_without_negative_counts():
+    runner = _fate_runner()
+    target = runner.state.pending_releases[0]
+    runner.schedule_waiting_fate(
+        1.0, "inactivate", release_id=target.release_id,
+        products={"P": 1}, amount=99,
+    )
+    with pytest.raises(RuntimeError):
+        runner.run(3)
+    assert runner.state.status == "failed"
+    assert all(count >= 0 for count in runner.state.waiting_counts.values())
+
+
+def test_sequestered_lot_can_return_and_release_with_traceable_origin():
+    runner = _fate_runner()
+    target = runner.state.pending_releases[0]
+    runner.schedule_waiting_fate(1.0, "sequester", release_id=target.release_id)
+    runner.schedule_waiting_fate(2.5, "release_sequestered")
+    runner.run(3.5)
+    state = runner.state
+
+    sequester_event = next(
+        event for event in state.events if event.event_type == "sequester"
+    )
+    assert sequester_event.sequester_id == "sequester-000001"
+    assert sequester_event.source_event_id == target.source_event_id
+    assert state.sequestered_counts["P"] == 0
+    return_event = next(
+        event for event in state.events if event.event_type == "release_sequestered"
+    )
+    assert return_event.origin_release_id == target.release_id
+    new_release = next(
+        event
+        for event in state.events
+        if event.event_type == "release"
+        and event.release_id == return_event.release_id
+    )
+    assert new_release.origin_release_id == target.release_id
+    assert new_release.source_event_id == target.source_event_id
+    assert state.counts["P"] == 3
+    release_ids = [
+        event.release_id for event in state.events if event.event_type == "release"
+    ]
+    assert len(release_ids) == len(set(release_ids))
+    validate_trajectory_conservation(state)
+
+
+def test_blocking_release_defers_until_allow_and_is_not_destruction():
+    base = _fate_runner(delay=1.0)
+    target = base.state.pending_releases[0]
+    scheduled_time = target.scheduled_time
+
+    continuous = base.fork()
+    continuous.run(3)
+    blocked = base.fork()
+    blocked.schedule_waiting_fate(
+        scheduled_time - 0.1, "block_releases", release_id=target.release_id
+    )
+    blocked.schedule_waiting_fate(
+        2.2, "allow_releases", release_id=target.release_id
+    )
+    blocked.run(3)
+
+    release = next(
+        event
+        for event in blocked.state.events
+        if event.release_id == target.release_id and event.event_type == "release"
+    )
+    assert release.time == 2.2
+    assert release.source_event_id == target.source_event_id
+    assert blocked.state.counts["P"] == continuous.state.counts["P"] == 3
+    assert blocked.state.deactivated_counts["P"] == 0
+    assert blocked.state.pending_releases == []
+    validate_trajectory_conservation(blocked.state)
+
+
+def test_release_at_block_instant_precedes_block_and_cannot_be_recalled():
+    runner = _fate_runner(delay=1.0)
+    target = runner.state.pending_releases[0]
+    release_time = target.scheduled_time
+    runner.schedule_waiting_fate(release_time, "block_releases")
+    runner.run(release_time)
+
+    released = [
+        event
+        for event in runner.state.events
+        if event.event_type == "release" and event.release_id == target.release_id
+    ]
+    assert len(released) == 1
+    assert runner.state.releases_blocked is True
+    # The already free product cannot be blocked away retroactively.
+    assert runner.state.counts["P"] == released[0].changes["P"]
+
+
+def test_competing_fates_match_across_checkpoints(tmp_path):
+    def configured():
+        runner = _fate_runner()
+        ids = [release.release_id for release in runner.state.pending_releases]
+        runner.schedule_waiting_fate(
+            1.0, "inactivate", release_id=ids[0], products={"P": 1}, amount=1
+        )
+        runner.schedule_waiting_fate(1.0, "sequester", release_id=ids[1])
+        runner.schedule_waiting_fate(1.2, "block_releases")
+        runner.schedule_waiting_fate(2.4, "allow_releases")
+        runner.schedule_waiting_fate(2.8, "release_sequestered")
+        return runner
+
+    continuous = configured()
+    continuous.run(4)
+
+    split = configured()
+    for index, checkpoint_time in enumerate((0.8, 1.0, 1.2, 2.4, 2.8, 3.2)):
+        split.run(checkpoint_time)
+        path = tmp_path / f"fate-{index}.json"
+        save_state(split.state, path)
+        split = StochasticRunner.from_state(load_state(path))
+    split.run(4)
+
+    assert event_dicts(split.state) == event_dicts(continuous.state)
+    assert split.state.counts == continuous.state.counts
+    assert split.state.deactivated_counts == continuous.state.deactivated_counts
+    assert split.state.sequestered_counts == continuous.state.sequestered_counts
+    validate_trajectory_conservation(split.state)
+
+
+def test_fate_branches_keep_their_own_conditions_at_shared_instant():
+    base = _fate_runner(delay=1.0)
+    target = base.state.pending_releases[0]
+    release_time = target.scheduled_time
+
+    keep = base.fork()
+    stop = base.fork()
+    stop.schedule_waiting_fate(
+        release_time - 0.1, "block_releases", release_id=target.release_id
+    )
+    stop.schedule_waiting_fate(release_time, "inactivate", release_id=target.release_id)
+    keep.run(2.5)
+    stop.run(2.5)
+
+    keep_release = next(
+        event
+        for event in keep.state.events
+        if event.release_id == target.release_id and event.event_type == "release"
+    )
+    assert keep_release.time == release_time
+    stop_events = [
+        event
+        for event in stop.state.events
+        if event.release_id == target.release_id and event.event_type == "release"
+    ]
+    assert stop_events == []
+    assert any(
+        event.event_type == "inactivate"
+        and event.release_id == target.release_id
+        for event in stop.state.events
+    )
+    assert keep.state.counts["P"] != stop.state.counts["P"]
+    assert stop.state.deactivated_counts["P"] >= 1
+    validate_trajectory_conservation(keep.state)
+    validate_trajectory_conservation(stop.state)

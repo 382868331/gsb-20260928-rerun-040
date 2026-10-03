@@ -47,6 +47,30 @@ python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json
 
 状态 JSON 包含 `waiting_counts` 与 `pending_releases`。每个反应事件的 `waiting_after` 给出事件后等待库存，释放事件带 `event_type="release"`、`release_id` 和 `source_event_id`。分支深拷贝后可各自释放检查点上的同一份挂账，但任一分支内同一 `release_id` 只允许出现一次。守恒检查会把各物种的等待数量与同名自由物一并计入。
 
+## 等待中间物的竞争去向
+
+等待中的每份产物除按原安排释放外，还可以通过 `StochasticRunner.schedule_waiting_fate(time, fate_type, ...)` 指定竞争去向。去向各自独立记账，减少等待量不等于反应没有发生过：自由产物在 `counts`，等待物在 `waiting_counts`/`pending_releases`，失活物累计在 `deactivated_counts`，隔离物累计在 `sequestered_counts`/`sequestered_lots`。守恒核对把四个账本一并计入，因此逐事件与总量都可追溯到最初启动反应的 `source_event_id`。
+
+- `inactivate`：对指定 `release_id`（给 `products`/`amount` 可只处理同一份等待物中的部分数量）或全部等待物失活。部分处理后剩余数量保留在原释放轨道上，并以新的 `release_id` 记账，但 `source_event_id` 不变；剩余为零时该批次消失，且不会再释放。
+- `sequester`：把等待物移入隔离账本并保留批次身份（`sequester_id`、原 `release_id`、`source_event_id`）。隔离期间既不释放也不进入倾向。
+- `release_sequestered`：在指定时刻（或对指定 `sequester_id`）把仍存在的隔离物移回等待轨道并立即参与释放；新批次使用新 `release_id`，事件上以 `origin_release_id` 标明被隔离批次，源事件身份不变。
+- `block_releases`/`allow_releases`：阻止或恢复释放，支持全局开关或针对单个 `release_id`。阻止不是销毁：被阻止的批次仍保留在等待账本中，恢复时刻仅仍存在且符合条件的数量释放（事件时刻为恢复时刻）；已经进入自由体系的部分无法被后来的阻止、失活或隔离追回，对已释放批次安排去向会直接报错。超出去往数量的申请同样报错，任何账本都不会出现负数。
+
+同一时刻多类事件的处理顺序固定为：开放的释放（按 `release_id` 稳定排序）→ 竞争去向（按声明顺序）→ 条件变更。因此与释放同刻声明的阻断不能追回该次释放，同刻的失活/隔离仍按切换前的条件版本结算；`fate_events` 与每个命运事件都记录结算时的 `condition_version`、`fate_id` 和逐物种数量。从同一检查点 `fork()` 出的分支各自保留当时的条件与去向依据，逐事件比较互不影响。
+
+保存点放在竞争事件前后同样与连续运行一致：命运与释放、条件变更一样作为可重放输入写入 `fate_schedule`，生效后写入 `fate_events`；预先抽取但尚未发生的反应若被竞争事件插入，其试探抽取连同随机数一并回滚重抽。旧版本状态 JSON（没有命运相关字段）可直接读取并续跑，旧的纯延迟释放轨迹与事件身份保持不变。
+
+CLI 示例：
+
+```bash
+python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json --end-time 6 \
+  --fate 2.5:inactivate:release=release-000001:amount=1:species=P \
+  --fate 3.0:sequester:species=P \
+  --fate 2.0:block_releases \
+  --fate 4.0:allow_releases \
+  --fate 5.0:release_sequestered
+```
+
 ## 异常停止
 
 运行中发生异常时，状态标记为 `status="failed"`，`failure_reason` 记录失败原因，数量与事件序列保持在最后一次可信状态；CLI 仍会保存状态文件并以非零码退出。

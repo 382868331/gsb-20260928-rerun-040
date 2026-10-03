@@ -40,14 +40,20 @@ def conserved_quantities(
     counts: dict[str, int],
     groups: Iterable[tuple[str, tuple[str, ...]]] = CONSERVED_GROUPS,
     waiting_counts: dict[str, int] | None = None,
+    deactivated_counts: dict[str, int] | None = None,
+    sequestered_counts: dict[str, int] | None = None,
 ) -> dict[str, int]:
     waiting_counts = waiting_counts or {}
+    deactivated_counts = deactivated_counts or {}
+    sequestered_counts = sequestered_counts or {}
     values: dict[str, int] = {}
     for name, species_ids in groups:
         total = 0
         for species_id in species_ids:
             total += counts.get(species_id, 0)
             total += waiting_counts.get(species_id, 0)
+            total += deactivated_counts.get(species_id, 0)
+            total += sequestered_counts.get(species_id, 0)
         values[name] = total
     return values
 
@@ -57,18 +63,39 @@ def validate_trajectory_conservation(
     groups: Iterable[tuple[str, tuple[str, ...]]] = CONSERVED_GROUPS,
 ) -> None:
     expected = conserved_quantities(state.model.initial_counts, groups)
-    checkpoints = [state.model.initial_counts] + [event.counts_after for event in state.events]
-    for event_index, counts in enumerate(checkpoints):
-        waiting = (
-            state.events[event_index - 1].waiting_after
-            if event_index > 0
-            else {}
+    checkpoints: list[tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]] = [
+        (state.model.initial_counts, {}, {}, {})
+    ]
+    for event in state.events:
+        checkpoints.append(
+            (
+                event.counts_after,
+                event.waiting_after,
+                event.deactivated_after,
+                event.sequestered_after,
+            )
         )
-        actual = conserved_quantities(counts, groups, waiting)
+    for event_index, (counts, waiting, deactivated, sequestered) in enumerate(checkpoints):
+        actual = conserved_quantities(
+            counts, groups, waiting, deactivated, sequestered
+        )
         if actual != expected:
             raise AssertionError(
                 f"conservation violated at event {event_index}: {actual} != {expected}"
             )
+    # Ledger cross-check: the final snapshots must agree with the state totals.
+    if state.events:
+        final_event = state.events[-1]
+        for ledger_name, state_ledger, snapshot in (
+            ("waiting", state.waiting_counts, final_event.waiting_after),
+            ("deactivated", state.deactivated_counts, final_event.deactivated_after),
+            ("sequestered", state.sequestered_counts, final_event.sequestered_after),
+        ):
+            for species_id in state.model.species_ids:
+                if state_ledger.get(species_id, 0) != snapshot.get(species_id, 0):
+                    raise AssertionError(
+                        f"{ledger_name} ledger disagrees with final event snapshot for {species_id}"
+                    )
 
 
 def run_short_experiments(
