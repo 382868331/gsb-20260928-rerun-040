@@ -14,9 +14,13 @@ from .persistence import load_model, load_state, save_model, save_state
 from .stochastic import (
     FATE_ALLOW_RELEASES,
     FATE_BLOCK_RELEASES,
+    FATE_CANCEL_RELEASE,
     FATE_INACTIVATE,
+    FATE_PAUSE_RELEASE,
     FATE_RELEASE_SEQUESTERED,
+    FATE_RESUME_RELEASE,
     FATE_SEQUESTER,
+    FATE_TRANSFORM,
     StochasticRunner,
 )
 
@@ -76,6 +80,10 @@ def parse_fate(spec: str) -> tuple[float, str, dict[str, object]]:
         FATE_RELEASE_SEQUESTERED,
         FATE_BLOCK_RELEASES,
         FATE_ALLOW_RELEASES,
+        FATE_TRANSFORM,
+        FATE_PAUSE_RELEASE,
+        FATE_RESUME_RELEASE,
+        FATE_CANCEL_RELEASE,
     }
     if kind not in valid:
         raise argparse.ArgumentTypeError(
@@ -144,8 +152,12 @@ def cmd_run(args: argparse.Namespace) -> None:
             "waiting_counts": runner.state.waiting_counts,
             "deactivated_counts": runner.state.deactivated_counts,
             "sequestered_counts": runner.state.sequestered_counts,
+            "transformed_counts": runner.state.transformed_counts,
+            "cancelled_counts": runner.state.cancelled_counts,
             "blocked_release_ids": sorted(runner.state.blocked_release_ids),
             "releases_blocked": runner.state.releases_blocked,
+            "paused_release_ids": sorted(runner.state.paused_release_ids),
+            "resource_occupancy": runner.state.resource_occupancy(),
             "pending_releases": [
                 release.to_dict() for release in runner.state.pending_releases
             ],
@@ -218,7 +230,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TIME:KIND[:KEY=VALUE]",
         help=(
             "schedule a waiting fate, e.g. 2.0:inactivate:release=release-000001:amount=1:species=P; "
-            "kinds: inactivate, sequester, release_sequestered, block_releases, allow_releases"
+            "kinds: inactivate, sequester, release_sequestered, block_releases, allow_releases, "
+            "transform, pause_release, resume_release, cancel_release"
         ),
     )
     run_parser.set_defaults(func=cmd_run)

@@ -707,3 +707,206 @@ def test_fate_branches_keep_their_own_conditions_at_shared_instant():
     assert stop.state.deactivated_counts["P"] >= 1
     validate_trajectory_conservation(keep.state)
     validate_trajectory_conservation(stop.state)
+
+
+def delayed_pair_model(delay: float = 2.0) -> ExperimentModel:
+    """Catalysis books two product units per batch so fates can split one batch."""
+    species = tuple(Species(species_id) for species_id in ("E", "S", "ES", "P"))
+    reactions = (
+        Reaction("bind", {"E": 1, "S": 1}, {"ES": 1}, rate_constant=10.0),
+        Reaction(
+            "catalyze",
+            {"ES": 2},
+            {"E": 2, "P": 2},
+            rate_constant=10.0,
+            product_delays={"P": delay},
+        ),
+    )
+    return ExperimentModel(
+        species=species,
+        reactions=reactions,
+        initial_counts={"E": 2, "S": 6, "ES": 0, "P": 0},
+    )
+
+
+def _pair_runner(delay: float = 2.0, seed: int = 4):
+    runner = StochasticRunner(delayed_pair_model(delay), seed=seed)
+    runner.run(0.6)
+    return runner
+
+
+def test_two_batches_partial_inactivate_and_transform_then_gate_cycle():
+    runner = _pair_runner()
+    batches = list(runner.state.pending_releases)
+    assert len(batches) == 3
+    first, second = batches[0], batches[1]
+    runner.schedule_waiting_fate(
+        1.0, "inactivate", release_id=first.release_id, products={"P": 1}, amount=1
+    )
+    runner.schedule_waiting_fate(
+        1.0, "transform", release_id=second.release_id, products={"P": 1}, amount=1
+    )
+    runner.schedule_waiting_fate(1.2, "block_releases")
+    runner.schedule_waiting_fate(2.6, "allow_releases")
+    runner.run(4)
+    state = runner.state
+
+    assert state.deactivated_counts["P"] == 1
+    assert state.transformed_counts["P"] == 1
+    assert state.cancelled_counts["P"] == 0
+    assert state.waiting_counts["P"] == 0
+    assert state.counts["P"] == 4
+
+    inactivate_event = next(e for e in state.events if e.event_type == "inactivate")
+    assert inactivate_event.release_id == first.release_id
+    assert inactivate_event.source_event_id == first.source_event_id
+    assert inactivate_event.changes == {"P": 1}
+    transform_event = next(e for e in state.events if e.event_type == "transform")
+    assert transform_event.release_id == second.release_id
+    assert transform_event.source_event_id == second.source_event_id
+    assert transform_event.changes == {"P": 1}
+
+    releases = [e for e in state.events if e.event_type == "release"]
+    assert len(releases) == 3
+    assert len({e.release_id for e in releases}) == 3
+    assert all(e.time == 2.6 for e in releases)
+    remainder_first = next(e for e in releases if e.release_id == first.release_id)
+    assert remainder_first.changes == {"P": 1}
+    assert remainder_first.source_event_id == first.source_event_id
+    remainder_second = next(e for e in releases if e.release_id == second.release_id)
+    assert remainder_second.changes == {"P": 1}
+    assert remainder_second.source_event_id == second.source_event_id
+    validate_trajectory_conservation(state)
+
+
+def test_competing_batches_match_across_save_restore(tmp_path):
+    def configured():
+        runner = _pair_runner()
+        ids = [release.release_id for release in runner.state.pending_releases]
+        runner.schedule_waiting_fate(
+            1.0, "inactivate", release_id=ids[0], products={"P": 1}, amount=1
+        )
+        runner.schedule_waiting_fate(
+            1.0, "transform", release_id=ids[1], products={"P": 1}, amount=1
+        )
+        runner.schedule_waiting_fate(1.2, "block_releases")
+        runner.schedule_waiting_fate(2.6, "allow_releases")
+        return runner
+
+    continuous = configured()
+    continuous.run(4)
+
+    split = configured()
+    for index, checkpoint_time in enumerate((0.9, 1.0, 1.2, 2.6, 3.1)):
+        split.run(checkpoint_time)
+        path = tmp_path / f"batch-{index}.json"
+        save_state(split.state, path)
+        split = StochasticRunner.from_state(load_state(path))
+    split.run(4)
+
+    assert event_dicts(split.state) == event_dicts(continuous.state)
+    assert split.state.deactivated_counts == continuous.state.deactivated_counts
+    assert split.state.transformed_counts == continuous.state.transformed_counts
+    assert split.state.cancelled_counts == continuous.state.cancelled_counts
+    assert split.state.resource_occupancy() == continuous.state.resource_occupancy()
+    validate_trajectory_conservation(split.state)
+
+
+def test_cancel_release_keeps_source_event_and_never_releases():
+    runner = _pair_runner()
+    target = runner.state.pending_releases[0]
+    source_event = next(
+        event for event in runner.state.events if event.event_id == target.source_event_id
+    )
+    runner.schedule_waiting_fate(1.0, "cancel_release", release_id=target.release_id)
+    runner.run(4)
+    state = runner.state
+
+    # Cancelling the release preparation does not undo the chemical event.
+    assert source_event in state.events
+    assert state.cancelled_counts["P"] == 2
+    assert state.waiting_counts["P"] == 0
+    assert state.counts["P"] == 4
+    cancel_event = next(e for e in state.events if e.event_type == "cancel_release")
+    assert cancel_event.release_id == target.release_id
+    assert cancel_event.source_event_id == target.source_event_id
+    assert cancel_event.changes == {"P": 2}
+
+    released_ids = [e.release_id for e in state.events if e.event_type == "release"]
+    assert target.release_id not in released_ids
+    assert len(released_ids) == len(set(released_ids))
+    validate_trajectory_conservation(state)
+
+    # Cancelling an already released batch is rejected on a fork.
+    released = StochasticRunner.from_state(state.fork())
+    released.schedule_waiting_fate(
+        state.time, "cancel_release", release_id=released_ids[0]
+    )
+    with pytest.raises(RuntimeError):
+        released.run(5)
+
+    # Cancelling the same batch twice is rejected as well.
+    runner.schedule_waiting_fate(state.time, "cancel_release", release_id=target.release_id)
+    with pytest.raises(RuntimeError):
+        runner.run(5)
+
+
+def test_pause_and_resume_single_batch_with_occupancy():
+    runner = _pair_runner()
+    target = runner.state.pending_releases[0]
+    other_ids = {
+        release.release_id for release in runner.state.pending_releases[1:]
+    }
+    runner.schedule_waiting_fate(1.0, "pause_release", release_id=target.release_id)
+    runner.run(3.0)
+    state = runner.state
+
+    # The other batches released on schedule; the paused batch still occupies
+    # the waiting track with its identity intact.
+    assert {release.release_id for release in state.pending_releases} == {
+        target.release_id
+    }
+    assert state.waiting_counts["P"] == 2
+    assert state.counts["P"] == 4
+    released_ids = {
+        event.release_id for event in state.events if event.event_type == "release"
+    }
+    assert released_ids == other_ids
+
+    occupancy = state.resource_occupancy()
+    assert occupancy["paused_release_ids"] == [target.release_id]
+    assert occupancy["ledgers"]["waiting"] == state.waiting_counts
+    statuses = {batch["release_id"]: batch["status"] for batch in occupancy["batches"]}
+    assert statuses == {target.release_id: "paused"}
+    assert occupancy["batches"][0]["source_event_id"] == target.source_event_id
+
+    runner.schedule_waiting_fate(3.5, "resume_release", release_id=target.release_id)
+    runner.run(4)
+    release = next(
+        event
+        for event in state.events
+        if event.event_type == "release" and event.release_id == target.release_id
+    )
+    assert release.time == 3.5
+    assert release.source_event_id == target.source_event_id
+    assert state.waiting_counts["P"] == 0
+    assert state.counts["P"] == 6
+    validate_trajectory_conservation(state)
+
+
+def test_full_transform_removes_batch_without_release():
+    runner = _pair_runner()
+    target = runner.state.pending_releases[0]
+    runner.schedule_waiting_fate(1.0, "transform", release_id=target.release_id)
+    runner.run(4)
+    state = runner.state
+
+    assert state.transformed_counts["P"] == 2
+    assert target.release_id not in {
+        event.release_id for event in state.events if event.event_type == "release"
+    }
+    assert target.release_id not in {
+        release.release_id for release in state.pending_releases
+    }
+    assert state.counts["P"] == 4
+    validate_trajectory_conservation(state)

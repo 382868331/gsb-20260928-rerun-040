@@ -42,10 +42,14 @@ def conserved_quantities(
     waiting_counts: dict[str, int] | None = None,
     deactivated_counts: dict[str, int] | None = None,
     sequestered_counts: dict[str, int] | None = None,
+    transformed_counts: dict[str, int] | None = None,
+    cancelled_counts: dict[str, int] | None = None,
 ) -> dict[str, int]:
     waiting_counts = waiting_counts or {}
     deactivated_counts = deactivated_counts or {}
     sequestered_counts = sequestered_counts or {}
+    transformed_counts = transformed_counts or {}
+    cancelled_counts = cancelled_counts or {}
     values: dict[str, int] = {}
     for name, species_ids in groups:
         total = 0
@@ -54,6 +58,8 @@ def conserved_quantities(
             total += waiting_counts.get(species_id, 0)
             total += deactivated_counts.get(species_id, 0)
             total += sequestered_counts.get(species_id, 0)
+            total += transformed_counts.get(species_id, 0)
+            total += cancelled_counts.get(species_id, 0)
         values[name] = total
     return values
 
@@ -63,9 +69,9 @@ def validate_trajectory_conservation(
     groups: Iterable[tuple[str, tuple[str, ...]]] = CONSERVED_GROUPS,
 ) -> None:
     expected = conserved_quantities(state.model.initial_counts, groups)
-    checkpoints: list[tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]] = [
-        (state.model.initial_counts, {}, {}, {})
-    ]
+    checkpoints: list[
+        tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int], dict[str, int], dict[str, int]]
+    ] = [(state.model.initial_counts, {}, {}, {}, {}, {})]
     for event in state.events:
         checkpoints.append(
             (
@@ -73,11 +79,13 @@ def validate_trajectory_conservation(
                 event.waiting_after,
                 event.deactivated_after,
                 event.sequestered_after,
+                event.transformed_after,
+                event.cancelled_after,
             )
         )
-    for event_index, (counts, waiting, deactivated, sequestered) in enumerate(checkpoints):
+    for event_index, (counts, waiting, deactivated, sequestered, transformed, cancelled) in enumerate(checkpoints):
         actual = conserved_quantities(
-            counts, groups, waiting, deactivated, sequestered
+            counts, groups, waiting, deactivated, sequestered, transformed, cancelled
         )
         if actual != expected:
             raise AssertionError(
@@ -90,6 +98,8 @@ def validate_trajectory_conservation(
             ("waiting", state.waiting_counts, final_event.waiting_after),
             ("deactivated", state.deactivated_counts, final_event.deactivated_after),
             ("sequestered", state.sequestered_counts, final_event.sequestered_after),
+            ("transformed", state.transformed_counts, final_event.transformed_after),
+            ("cancelled", state.cancelled_counts, final_event.cancelled_after),
         ):
             for species_id in state.model.species_ids:
                 if state_ledger.get(species_id, 0) != snapshot.get(species_id, 0):

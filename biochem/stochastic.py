@@ -34,7 +34,10 @@ class ReactionEvent:
     origin_release_id: str | None = None
     deactivated_after: dict[str, int] = field(default_factory=dict)
     sequestered_after: dict[str, int] = field(default_factory=dict)
+    transformed_after: dict[str, int] = field(default_factory=dict)
+    cancelled_after: dict[str, int] = field(default_factory=dict)
     blocked_after: tuple[str, ...] = ()
+    paused_after: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -72,7 +75,14 @@ class ReactionEvent:
             sequestered_after={
                 str(k): int(v) for k, v in data.get("sequestered_after", {}).items()
             },
+            transformed_after={
+                str(k): int(v) for k, v in data.get("transformed_after", {}).items()
+            },
+            cancelled_after={
+                str(k): int(v) for k, v in data.get("cancelled_after", {}).items()
+            },
             blocked_after=tuple(str(item) for item in data.get("blocked_after", [])),
+            paused_after=tuple(str(item) for item in data.get("paused_after", [])),
         )
 
 
@@ -166,12 +176,20 @@ FATE_SEQUESTER = "sequester"
 FATE_RELEASE_SEQUESTERED = "release_sequestered"
 FATE_BLOCK_RELEASES = "block_releases"
 FATE_ALLOW_RELEASES = "allow_releases"
+FATE_TRANSFORM = "transform"
+FATE_PAUSE_RELEASE = "pause_release"
+FATE_RESUME_RELEASE = "resume_release"
+FATE_CANCEL_RELEASE = "cancel_release"
 FATE_TYPES = (
     FATE_INACTIVATE,
     FATE_SEQUESTER,
     FATE_RELEASE_SEQUESTERED,
     FATE_BLOCK_RELEASES,
     FATE_ALLOW_RELEASES,
+    FATE_TRANSFORM,
+    FATE_PAUSE_RELEASE,
+    FATE_RESUME_RELEASE,
+    FATE_CANCEL_RELEASE,
 )
 
 
@@ -283,8 +301,11 @@ class TrajectoryState:
     fate_events: list[WaitingFate] = field(default_factory=list)
     blocked_release_ids: set[str] = field(default_factory=set)
     releases_blocked: bool = False
+    paused_release_ids: set[str] = field(default_factory=set)
     deactivated_counts: dict[str, int] = field(default_factory=dict)
     sequestered_counts: dict[str, int] = field(default_factory=dict)
+    transformed_counts: dict[str, int] = field(default_factory=dict)
+    cancelled_counts: dict[str, int] = field(default_factory=dict)
     sequestered_lots: list[SequesteredLot] = field(default_factory=list)
     next_fate_number: int = 1
     next_sequester_number: int = 1
@@ -306,6 +327,14 @@ class TrajectoryState:
             species.id: int(self.sequestered_counts.get(species.id, 0))
             for species in self.model.species
         }
+        self.transformed_counts = {
+            species.id: int(self.transformed_counts.get(species.id, 0))
+            for species in self.model.species
+        }
+        self.cancelled_counts = {
+            species.id: int(self.cancelled_counts.get(species.id, 0))
+            for species in self.model.species
+        }
         for species_id, count in self.counts.items():
             if count < 0:
                 raise ValueError(f"count cannot be negative: {species_id}")
@@ -318,6 +347,12 @@ class TrajectoryState:
         for species_id, count in self.sequestered_counts.items():
             if count < 0:
                 raise ValueError(f"sequestered count cannot be negative: {species_id}")
+        for species_id, count in self.transformed_counts.items():
+            if count < 0:
+                raise ValueError(f"transformed count cannot be negative: {species_id}")
+        for species_id, count in self.cancelled_counts.items():
+            if count < 0:
+                raise ValueError(f"cancelled count cannot be negative: {species_id}")
         self.condition_schedule.sort(key=lambda change: change.time)
         self.fate_schedule.sort(key=lambda fate: fate.time)
         self.pending_releases.sort(key=lambda release: (release.scheduled_time, release.release_id))
@@ -397,8 +432,11 @@ class TrajectoryState:
             "fate_events": [event.to_dict() for event in self.fate_events],
             "blocked_release_ids": sorted(self.blocked_release_ids),
             "releases_blocked": self.releases_blocked,
+            "paused_release_ids": sorted(self.paused_release_ids),
             "deactivated_counts": dict(self.deactivated_counts),
             "sequestered_counts": dict(self.sequestered_counts),
+            "transformed_counts": dict(self.transformed_counts),
+            "cancelled_counts": dict(self.cancelled_counts),
             "sequestered_lots": [lot.to_dict() for lot in self.sequestered_lots],
             "next_fate_number": self.next_fate_number,
             "next_sequester_number": self.next_sequester_number,
@@ -447,11 +485,20 @@ class TrajectoryState:
                 str(item) for item in data.get("blocked_release_ids", [])
             },
             releases_blocked=bool(data.get("releases_blocked", False)),
+            paused_release_ids={
+                str(item) for item in data.get("paused_release_ids", [])
+            },
             deactivated_counts={
                 str(k): int(v) for k, v in data.get("deactivated_counts", {}).items()
             },
             sequestered_counts={
                 str(k): int(v) for k, v in data.get("sequestered_counts", {}).items()
+            },
+            transformed_counts={
+                str(k): int(v) for k, v in data.get("transformed_counts", {}).items()
+            },
+            cancelled_counts={
+                str(k): int(v) for k, v in data.get("cancelled_counts", {}).items()
             },
             sequestered_lots=[
                 SequesteredLot.from_dict(item)
@@ -466,6 +513,53 @@ class TrajectoryState:
         """Deep-copy a checkpoint so branches never share RNG or event state."""
 
         return TrajectoryState.from_dict(self.to_dict())
+
+    def resource_occupancy(self) -> dict[str, Any]:
+        """Per-batch snapshot of where every not-yet-free product currently sits.
+
+        Totals alone cannot explain occupancy: each waiting batch keeps its
+        release_id/source_event_id and an explicit status, and every competing
+        destination (deactivated, transformed, cancelled, sequestered) is
+        reported as its own ledger.
+        """
+        batches: list[dict[str, Any]] = []
+        for release in self.pending_releases:
+            if release.release_id in self.paused_release_ids:
+                status = "paused"
+            elif self.releases_blocked or release.release_id in self.blocked_release_ids:
+                status = "blocked"
+            else:
+                status = "waiting"
+            batches.append(
+                {
+                    "release_id": release.release_id,
+                    "source_event_id": release.source_event_id,
+                    "reaction_id": release.reaction_id,
+                    "products": dict(release.products),
+                    "created_time": release.created_time,
+                    "scheduled_time": release.scheduled_time,
+                    "condition_version": release.condition_version,
+                    "origin_release_id": release.origin_release_id,
+                    "origin_fate": release.origin_fate,
+                    "status": status,
+                }
+            )
+        return {
+            "time": self.time,
+            "free_counts": dict(self.counts),
+            "ledgers": {
+                "waiting": dict(self.waiting_counts),
+                "deactivated": dict(self.deactivated_counts),
+                "transformed": dict(self.transformed_counts),
+                "cancelled": dict(self.cancelled_counts),
+                "sequestered": dict(self.sequestered_counts),
+            },
+            "batches": batches,
+            "sequestered_lots": [lot.to_dict() for lot in self.sequestered_lots],
+            "releases_blocked": self.releases_blocked,
+            "blocked_release_ids": sorted(self.blocked_release_ids),
+            "paused_release_ids": sorted(self.paused_release_ids),
+        }
 
 
 class StochasticRunner:
@@ -553,6 +647,12 @@ class StochasticRunner:
         ``sequester_id``, or all lots) to a fresh pending release at ``time``.
         ``block_releases``/``allow_releases`` toggle the release gate, either
         globally or for one ``release_id``; blocking is not destruction.
+        ``transform`` moves waiting material into the transformed ledger like
+        ``inactivate`` moves it into the deactivated one. ``pause_release``/
+        ``resume_release`` hold and re-enable one batch without touching its
+        quantity. ``cancel_release`` abandons one batch's release preparation:
+        the material leaves the waiting track for the cancelled ledger, the
+        source reaction event stays on record, and the batch never releases.
         """
         if time < self.state.time:
             raise ValueError("fate time precedes current trajectory time")
@@ -570,15 +670,25 @@ class StochasticRunner:
                 if value <= 0:
                     raise ValueError("fate product amounts must be positive")
                 normalized_products[species_id] = value
-        if fate_type in (FATE_INACTIVATE, FATE_SEQUESTER):
+        if fate_type in (FATE_INACTIVATE, FATE_SEQUESTER, FATE_TRANSFORM):
             if sequester_id is not None:
                 raise ValueError(f"{fate_type} cannot target a sequestered lot")
         elif fate_type == FATE_RELEASE_SEQUESTERED:
             if release_id is not None:
                 raise ValueError("release_sequestered targets a sequester_id")
-        else:  # gate toggles
+        elif fate_type in (FATE_BLOCK_RELEASES, FATE_ALLOW_RELEASES):
             if amount is not None or normalized_products is not None:
                 raise ValueError(f"{fate_type} only toggles the release gate")
+        elif fate_type in (FATE_PAUSE_RELEASE, FATE_RESUME_RELEASE):
+            if release_id is None:
+                raise ValueError(f"{fate_type} requires a release_id")
+            if amount is not None or normalized_products is not None:
+                raise ValueError(f"{fate_type} only pauses or resumes one batch")
+        else:  # FATE_CANCEL_RELEASE
+            if release_id is None:
+                raise ValueError("cancel_release requires a release_id")
+            if sequester_id is not None:
+                raise ValueError("cancel_release cannot target a sequestered lot")
         fate = WaitingFate(
             time=float(time),
             fate_type=fate_type,
@@ -615,6 +725,8 @@ class StochasticRunner:
     def _release_is_blocked(self, release: PendingRelease) -> bool:
         return self.state.releases_blocked or (
             release.release_id in self.state.blocked_release_ids
+        ) or (
+            release.release_id in self.state.paused_release_ids
         )
 
     def _next_open_release(self) -> PendingRelease | None:
@@ -745,6 +857,7 @@ class StochasticRunner:
             item for item in self.state.pending_releases if item.release_id != release.release_id
         ]
         self.state.blocked_release_ids.discard(release.release_id)
+        self.state.paused_release_ids.discard(release.release_id)
         origin_text = (
             f"; origin_release_id={release.origin_release_id} via {release.origin_fate}"
             if release.origin_release_id is not None
@@ -774,7 +887,10 @@ class StochasticRunner:
             waiting_after={k: v for k, v in new_waiting.items() if v != 0},
             deactivated_after={k: v for k, v in self.state.deactivated_counts.items() if v != 0},
             sequestered_after={k: v for k, v in self.state.sequestered_counts.items() if v != 0},
+            transformed_after={k: v for k, v in self.state.transformed_counts.items() if v != 0},
+            cancelled_after={k: v for k, v in self.state.cancelled_counts.items() if v != 0},
             blocked_after=tuple(sorted(self.state.blocked_release_ids)),
+            paused_after=tuple(sorted(self.state.paused_release_ids)),
             pending_releases=self._snapshot_pending_releases(),
         )
         self.state.events.append(event)
@@ -830,7 +946,10 @@ class StochasticRunner:
             waiting_after={k: v for k, v in self.state.waiting_counts.items() if v != 0},
             deactivated_after={k: v for k, v in self.state.deactivated_counts.items() if v != 0},
             sequestered_after={k: v for k, v in self.state.sequestered_counts.items() if v != 0},
+            transformed_after={k: v for k, v in self.state.transformed_counts.items() if v != 0},
+            cancelled_after={k: v for k, v in self.state.cancelled_counts.items() if v != 0},
             blocked_after=tuple(sorted(self.state.blocked_release_ids)),
+            paused_after=tuple(sorted(self.state.paused_release_ids)),
         )
         self.state.events.append(event)
         return event
@@ -868,6 +987,7 @@ class StochasticRunner:
                 if item.release_id != release.release_id
             ]
             self.state.blocked_release_ids.discard(release.release_id)
+            self.state.paused_release_ids.discard(release.release_id)
 
     def _apply_fate(self, fate: WaitingFate) -> list[ReactionEvent]:
         fate_id = f"fate-{self.state.next_fate_number:06d}"
@@ -875,7 +995,12 @@ class StochasticRunner:
         events: list[ReactionEvent] = []
         self.state.time = fate.time
 
-        if fate.fate_type in (FATE_INACTIVATE, FATE_SEQUESTER):
+        if fate.fate_type in (
+            FATE_INACTIVATE,
+            FATE_SEQUESTER,
+            FATE_TRANSFORM,
+            FATE_CANCEL_RELEASE,
+        ):
             if fate.release_id is not None:
                 target = next(
                     (
@@ -892,11 +1017,12 @@ class StochasticRunner:
                 targets = [target]
             else:
                 targets = list(self.state.pending_releases)
-            ledger = (
-                self.state.deactivated_counts
-                if fate.fate_type == FATE_INACTIVATE
-                else self.state.sequestered_counts
-            )
+            ledger = {
+                FATE_INACTIVATE: self.state.deactivated_counts,
+                FATE_SEQUESTER: self.state.sequestered_counts,
+                FATE_TRANSFORM: self.state.transformed_counts,
+                FATE_CANCEL_RELEASE: self.state.cancelled_counts,
+            }[fate.fate_type]
             for release in targets:
                 wanted = self._target_products(release, fate.products)
                 if fate.amount is not None and fate.release_id is not None:
@@ -1047,26 +1173,40 @@ class StochasticRunner:
                         origin_release_id=lot.release_id,
                     )
                 )
-        else:  # gate toggles
-            blocking = fate.fate_type == FATE_BLOCK_RELEASES
-            if fate.release_id is None:
-                self.state.releases_blocked = blocking
-                if blocking:
-                    # The global flag blocks every batch; the id set keeps
-                    # only explicitly per-id blocks across a global toggle.
-                    pass
-            else:
-                if blocking:
+        else:  # gate toggles and per-batch pause/resume
+            if fate.fate_type in (FATE_BLOCK_RELEASES, FATE_ALLOW_RELEASES):
+                blocking = fate.fate_type == FATE_BLOCK_RELEASES
+                if fate.release_id is None:
+                    self.state.releases_blocked = blocking
+                    if blocking:
+                        # The global flag blocks every batch; the id set keeps
+                        # only explicitly per-id blocks across a global toggle.
+                        pass
+                else:
+                    if blocking:
+                        if not any(
+                            item.release_id == fate.release_id
+                            for item in self.state.pending_releases
+                        ):
+                            raise RuntimeError(
+                                f"fate {fate_id} blocks unknown or gone release {fate.release_id}"
+                            )
+                        self.state.blocked_release_ids.add(fate.release_id)
+                    else:
+                        self.state.blocked_release_ids.discard(fate.release_id)
+            else:  # pause_release / resume_release target exactly one batch
+                pausing = fate.fate_type == FATE_PAUSE_RELEASE
+                if pausing:
                     if not any(
                         item.release_id == fate.release_id
                         for item in self.state.pending_releases
                     ):
                         raise RuntimeError(
-                            f"fate {fate_id} blocks unknown or gone release {fate.release_id}"
+                            f"fate {fate_id} pauses unknown or gone release {fate.release_id}"
                         )
-                    self.state.blocked_release_ids.add(fate.release_id)
+                    self.state.paused_release_ids.add(fate.release_id)
                 else:
-                    self.state.blocked_release_ids.discard(fate.release_id)
+                    self.state.paused_release_ids.discard(fate.release_id)
             source = next(
                 (
                     item
@@ -1299,7 +1439,14 @@ class StochasticRunner:
             sequestered_after={
                 k: v for k, v in self.state.sequestered_counts.items() if v != 0
             },
+            transformed_after={
+                k: v for k, v in self.state.transformed_counts.items() if v != 0
+            },
+            cancelled_after={
+                k: v for k, v in self.state.cancelled_counts.items() if v != 0
+            },
             blocked_after=tuple(sorted(self.state.blocked_release_ids)),
+            paused_after=tuple(sorted(self.state.paused_release_ids)),
             pending_releases=tuple(planned_releases),
         )
 
