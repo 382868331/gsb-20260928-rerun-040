@@ -49,9 +49,11 @@ python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json
 
 ## 等待中间物的竞争去向
 
-等待中的每份产物除按原安排释放外，还可以通过 `StochasticRunner.schedule_waiting_fate(time, fate_type, ...)` 指定竞争去向。去向各自独立记账，减少等待量不等于反应没有发生过：自由产物在 `counts`，等待物在 `waiting_counts`/`pending_releases`，失活物累计在 `deactivated_counts`，隔离物累计在 `sequestered_counts`/`sequestered_lots`。守恒核对把四个账本一并计入，因此逐事件与总量都可追溯到最初启动反应的 `source_event_id`。
+等待中的每份产物除按原安排释放外，还可以通过 `StochasticRunner.schedule_waiting_fate(time, fate_type, ...)` 指定竞争去向。去向各自独立记账，减少等待量不等于反应没有发生过：自由产物在 `counts`，等待物在 `waiting_counts`/`pending_releases`，失活物累计在 `deactivated_counts`，转化物累计在 `converted_counts`，被取消的释放准备累计在 `cancelled_counts`，隔离物累计在 `sequestered_counts`/`sequestered_lots`。守恒核对把六个账本一并计入，因此逐事件与总量都可追溯到最初启动反应的 `source_event_id`。`StochasticRunner.release_resource_occupancy()` 给出当前释放资源的逐批占用：每个仍在等待的批次保留自己的 `release_id`、`source_event_id`、数量、预定时刻与闸门状态，而不是只核对总量。
 
-- `inactivate`：对指定 `release_id`（给 `products`/`amount` 可只处理同一份等待物中的部分数量）或全部等待物失活。部分处理后剩余数量保留在原释放轨道上，并以新的 `release_id` 记账，但 `source_event_id` 不变；剩余为零时该批次消失，且不会再释放。
+- `inactivate`：对指定 `release_id`（给 `products`/`amount` 可只处理同一份等待物中的部分数量）或全部等待物失活。部分处理后剩余数量保留在原释放轨道上，`source_event_id` 不变；剩余为零时该批次消失，且不会再释放。
+- `convert`：与 `inactivate` 同样的指定方式，把等待物记入转化账本 `converted_counts`。部分转化后剩余量与派生批次都保留来源 `source_event_id`，转化量既不释放也不进入倾向。
+- `cancel_release`：单独取消某批次（或全部批次）尚未完成的释放准备，数量移入 `cancelled_counts`。取消不撤销已经发生的化学反应事件（源事件与其数量变化保留），被取消的部分之后也不会再释放；对已释放或不存在的 `release_id` 安排取消会直接报错。`block_releases` 加 `release_id` 则是可逆的暂停：批次仍留在等待账本中，恢复后继续释放。
 - `sequester`：把等待物移入隔离账本并保留批次身份（`sequester_id`、原 `release_id`、`source_event_id`）。隔离期间既不释放也不进入倾向。
 - `release_sequestered`：在指定时刻（或对指定 `sequester_id`）把仍存在的隔离物移回等待轨道并立即参与释放；新批次使用新 `release_id`，事件上以 `origin_release_id` 标明被隔离批次，源事件身份不变。
 - `block_releases`/`allow_releases`：阻止或恢复释放，支持全局开关或针对单个 `release_id`。阻止不是销毁：被阻止的批次仍保留在等待账本中，恢复时刻仅仍存在且符合条件的数量释放（事件时刻为恢复时刻）；已经进入自由体系的部分无法被后来的阻止、失活或隔离追回，对已释放批次安排去向会直接报错。超出去往数量的申请同样报错，任何账本都不会出现负数。
@@ -66,6 +68,8 @@ CLI 示例：
 python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json --end-time 6 \
   --fate 2.5:inactivate:release=release-000001:amount=1:species=P \
   --fate 3.0:sequester:species=P \
+  --fate 3.5:convert:release=release-000002:amount=1:species=P \
+  --fate 4.5:cancel_release:release=release-000003 \
   --fate 2.0:block_releases \
   --fate 4.0:allow_releases \
   --fate 5.0:release_sequestered
