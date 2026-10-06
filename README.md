@@ -10,6 +10,7 @@
 - `biochem/deterministic.py`：同一模型的 RK4 确定性计算。
 - `biochem/analysis.py`：守恒检查和多次短实验的平均变化比较。
 - `biochem/persistence.py`：模型与中途轨迹的 JSON 保存/读取。
+- `biochem/scheduling.py`：多反应链之间的释放资源调度研究。
 
 内置网络为 `E + S ↔ ES → E + P`。它有两条守恒关系：`E + ES` 守恒，`S + ES + P` 守恒。任一反应物数量不足时，对应倾向为零，反应不会发生。
 
@@ -61,6 +62,25 @@ python -m biochem.cli run --model artifacts/model.json --state artifacts/t1.json
 同一时刻多类事件的处理顺序固定为：开放的释放（按 `release_id` 稳定排序）→ 竞争去向（按声明顺序）→ 条件变更。因此与释放同刻声明的阻断不能追回该次释放，同刻的失活/隔离仍按切换前的条件版本结算；`fate_events` 与每个命运事件都记录结算时的 `condition_version`、`fate_id` 和逐物种数量。从同一检查点 `fork()` 出的分支各自保留当时的条件与去向依据，逐事件比较互不影响。
 
 保存点放在竞争事件前后同样与连续运行一致：命运与释放、条件变更一样作为可重放输入写入 `fate_schedule`，生效后写入 `fate_events`；预先抽取但尚未发生的反应若被竞争事件插入，其试探抽取连同随机数一并回滚重抽。旧版本状态 JSON（没有命运相关字段）可直接读取并续跑，旧的纯延迟释放轨迹与事件身份保持不变。
+
+## 多反应链之间的释放调度研究
+
+`biochem/scheduling.py` 在既有等待批次之上做释放调度研究。研究者用 `ChainTarget` 为每条反应链指定目标游离量 `targets`、释放时窗 `[window_start, window_end]` 和不可恢复的失活速率 `deactivation_rate`；`plan_release_schedule(state, chains, capacity, policy)` 在释放容量（单位时间最多 `capacity` 次释放）约束下为现有等待批次安排释放顺序，输出逐批的 `ReleaseAllocation`（链、`release_id`、`source_event_id`、数量、释放时刻）与未满足缺口 `unmet`。两条策略可比较：`earliest_target` 尽早达到目标，`min_deactivation` 优先释放失活暴露最大的批次以减少失活损失。
+
+调度遵守两条不变量：
+
+- 预测转化产物不能提前当成已存在资源：只有当前 `pending_releases` 中真实等待的批次可分配，计划中的转化去向和未来反应事件产生的物料都不计入。
+- 同一派生批次不能同时支持两条链的全部承诺：同一批次对所有链的承诺总量不超过其实际数量。
+
+`execute_schedule(runner, chains, capacity, policy, end_time)` 执行计划：实际转化、失活、部分取消或释放门中途关闭与计划偏离时，只重算尚未发生部分——已发生反应和已释放数量原样保留，缺口按当前状态重新规划；每次重算记录时刻与原因。执行不会越过 `end_time` 提交任何事件。`compare_policies` 从同一检查点 `fork()` 出独立分支分别执行两条策略并返回两份 `ExecutionReport`（含目标达成时刻、逐链已释放量、计划历史）。
+
+CLI 示例：
+
+```bash
+python -m biochem.cli schedule --model artifacts/model.json --end-time 6 --capacity 2 \
+  --chain chainA:P=3@0-6:loss=0.2 --chain chainB:P=2@1-6 \
+  --fate 2.0:block_releases --fate 4.0:allow_releases
+```
 
 CLI 示例：
 

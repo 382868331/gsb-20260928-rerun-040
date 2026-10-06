@@ -7,6 +7,14 @@ from biochem.deterministic import rk4_scan
 from biochem.models import ExperimentModel, Reaction, Species, build_conservation_network
 from biochem.persistence import load_state, save_state
 from biochem.rules import MassActionRule
+from biochem.scheduling import (
+    POLICY_EARLIEST_TARGET,
+    POLICY_MIN_DEACTIVATION,
+    ChainTarget,
+    compare_policies,
+    execute_schedule,
+    plan_release_schedule,
+)
 from biochem.stochastic import PendingRelease, StochasticRunner
 
 
@@ -905,3 +913,197 @@ def test_cancel_unknown_or_released_batch_fails():
     assert runner.state.status == "failed"
     assert all(count >= 0 for count in runner.state.waiting_counts.values())
     assert all(count >= 0 for count in runner.state.cancelled_counts.values())
+
+
+def _scheduling_chains(**overrides):
+    base = {
+        "chainA": ChainTarget("chainA", {"P": 3}, 0.0, 10.0, deactivation_rate=0.3),
+        "chainB": ChainTarget("chainB", {"P": 3}, 0.0, 10.0, deactivation_rate=0.1),
+    }
+    base.update(overrides)
+    return list(base.values())
+
+
+def test_shared_batch_cannot_fully_commit_to_two_chains():
+    runner = _two_batch_runner()
+    chains = _scheduling_chains()
+
+    plan = plan_release_schedule(runner.state, chains, capacity=10.0)
+
+    per_batch: dict[str, int] = {}
+    for allocation in plan.allocations:
+        per_batch[allocation.release_id] = (
+            per_batch.get(allocation.release_id, 0) + sum(allocation.products.values())
+        )
+    # No derived batch promises more than it holds to the chains combined.
+    assert per_batch == {"release-000001": 2, "release-000002": 2}
+    # The two chains cannot both be fully served by the same batches.
+    assert plan.unmet == {"chainB": {"P": 2}}
+    served = {}
+    for allocation in plan.allocations:
+        served[allocation.chain_id] = (
+            served.get(allocation.chain_id, 0) + sum(allocation.products.values())
+        )
+    assert served == {"chainA": 3, "chainB": 1}
+
+
+def test_predicted_conversion_products_are_not_plannable_resources():
+    # A fresh trajectory will produce delayed P later, and a future convert
+    # fate is scheduled, but nothing is waiting yet: nothing can be planned.
+    runner = StochasticRunner(delayed_model(1.0), seed=4)
+    runner.schedule_waiting_fate(2.0, "convert", products={"P": 1})
+    chains = [ChainTarget("chainA", {"P": 1}, 0.0, 10.0)]
+
+    plan = plan_release_schedule(runner.state, chains, capacity=5.0)
+
+    assert plan.allocations == ()
+    assert plan.unmet == {"chainA": {"P": 1}}
+
+
+def test_capacity_limits_release_spacing_and_window():
+    runner = _two_batch_runner()
+    chains = [ChainTarget("chainA", {"P": 4}, 0.0, 10.0)]
+
+    plan = plan_release_schedule(
+        runner.state, chains, capacity=1.0, policy=POLICY_EARLIEST_TARGET
+    )
+    times = sorted(allocation.release_time for allocation in plan.allocations)
+    assert len(times) == 2
+    assert times[1] - times[0] >= 1.0 - 1e-9
+
+    tight = plan_release_schedule(
+        runner.state,
+        [ChainTarget("chainA", {"P": 4}, 0.0, 2.6)],
+        capacity=1.0,
+    )
+    assert len(tight.allocations) == 1
+    assert tight.unmet == {"chainA": {"P": 2}}
+
+
+def test_min_deactivation_policy_prioritizes_loss_prone_chain():
+    runner = _two_batch_runner()
+    chains = _scheduling_chains()
+
+    plan = plan_release_schedule(
+        runner.state, chains, capacity=10.0, policy=POLICY_MIN_DEACTIVATION
+    )
+
+    assert plan.allocations
+    chain_a_times = [
+        allocation.release_time
+        for allocation in plan.allocations
+        if allocation.chain_id == "chainA"
+    ]
+    chain_b_times = [
+        allocation.release_time
+        for allocation in plan.allocations
+        if allocation.chain_id == "chainB"
+    ]
+    # The more loss-prone chain is served first.
+    assert chain_a_times and chain_b_times
+    assert max(chain_a_times) < max(chain_b_times)
+    assert plan.unmet == {"chainB": {"P": 2}}
+
+
+def test_execute_replans_after_partial_cancel_and_keeps_released():
+    runner = _two_batch_runner()
+    chains = [ChainTarget("chainA", {"P": 4}, 0.0, 10.0)]
+    runner.schedule_waiting_fate(
+        1.0, "cancel_release", release_id="release-000002", products={"P": 1}, amount=1
+    )
+
+    report = execute_schedule(runner, chains, capacity=10.0, end_time=6.0)
+    state = runner.state
+
+    assert report.replans
+    assert any(
+        "release-000002" in reason
+        for replan in report.replans
+        for reason in replan["reasons"]
+    )
+    assert len(report.plans) == 1 + len(report.replans)
+    # Already released amounts are kept and credited exactly once.
+    released_events = [
+        event for event in state.events if event.event_type == "release"
+    ]
+    released_total = sum(
+        event.changes.get("P", 0) for event in released_events
+    )
+    assert report.released["chainA"]["P"] == released_total == 3
+    # The cancelled unit is never recovered: the target stays unmet.
+    assert report.target_times["chainA"] is None
+    assert report.plans[-1].unmet == {"chainA": {"P": 1}}
+    assert state.cancelled_counts["P"] == 1
+    # Per-batch provenance survives the replan.
+    sources = {event.release_id: event.source_event_id for event in released_events}
+    assert sources["release-000001"] == "event-000001"
+    assert sources["release-000002"] == "event-000002"
+    validate_trajectory_conservation(state)
+
+
+def test_execute_replans_after_midway_gate_close():
+    runner = _two_batch_runner()
+    chains = [ChainTarget("chainA", {"P": 4}, 0.0, 10.0)]
+    runner.schedule_waiting_fate(1.0, "block_releases")
+    runner.schedule_waiting_fate(3.0, "allow_releases")
+
+    report = execute_schedule(runner, chains, capacity=10.0, end_time=6.0)
+    state = runner.state
+
+    gate_replans = [
+        replan
+        for replan in report.replans
+        if any("gate" in reason for reason in replan["reasons"])
+    ]
+    assert len(gate_replans) == 2
+    releases = [event for event in state.events if event.event_type == "release"]
+    assert releases
+    # Nothing released while the gate was closed; everything queued to 3.0.
+    assert all(event.time == 3.0 for event in releases)
+    assert report.released["chainA"]["P"] == 4
+    assert state.counts["P"] == 4
+    validate_trajectory_conservation(state)
+
+
+def test_compare_policies_runs_both_on_independent_forks():
+    runner = _two_batch_runner()
+    chains = _scheduling_chains()
+    events_before = len(runner.state.events)
+
+    reports = compare_policies(runner, chains, capacity=2.0, end_time=6.0)
+
+    assert set(reports) == {POLICY_EARLIEST_TARGET, POLICY_MIN_DEACTIVATION}
+    for report in reports.values():
+        assert report.plans
+        assert report.status in {"time_limit", "exhausted"}
+    # The checkpoint runner itself is untouched by the forks.
+    assert len(runner.state.events) == events_before
+
+
+def test_execute_never_commits_beyond_end_time():
+    runner = _two_batch_runner()
+    chains = [ChainTarget("chainA", {"P": 4}, 0.0, 10.0)]
+
+    report = execute_schedule(runner, chains, capacity=10.0, end_time=2.6)
+
+    assert report.final_time <= 2.6
+    assert all(event.time <= 2.6 for event in runner.state.events)
+    assert report.released["chainA"]["P"] == 2
+    validate_trajectory_conservation(runner.state)
+
+
+def test_scheduling_rejects_invalid_inputs():
+    runner = _two_batch_runner()
+    chains = _scheduling_chains()
+    with pytest.raises(ValueError):
+        plan_release_schedule(runner.state, chains, capacity=0.0)
+    with pytest.raises(ValueError):
+        plan_release_schedule(runner.state, chains, capacity=1.0, policy="unknown")
+    with pytest.raises(ValueError):
+        plan_release_schedule(
+            runner.state,
+            [ChainTarget("chainA", {"X": 1}, 0.0, 1.0)],
+            capacity=1.0,
+        )
+    with pytest.raises(ValueError):
+        ChainTarget("chainA", {"P": 1}, 2.0, 1.0).validate({"P"})

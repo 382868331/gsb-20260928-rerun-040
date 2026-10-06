@@ -11,6 +11,12 @@ from .analysis import conserved_quantities, run_short_experiments, validate_traj
 from .deterministic import rk4_scan
 from .models import build_conservation_network
 from .persistence import load_model, load_state, save_model, save_state
+from .scheduling import (
+    POLICIES,
+    ChainTarget,
+    compare_policies,
+    execute_schedule,
+)
 from .stochastic import (
     FATE_ALLOW_RELEASES,
     FATE_BLOCK_RELEASES,
@@ -115,6 +121,48 @@ def parse_fate(spec: str) -> tuple[float, str, dict[str, object]]:
     return time_value, kind, options
 
 
+def parse_chain(spec: str) -> ChainTarget:
+    """Parse ID:SPECIES=N[,SPECIES=N]@START-END[:loss=RATE] into a ChainTarget."""
+    try:
+        chain_id, rest = spec.split(":", 1)
+        targets_text, rest = rest.split("@", 1)
+        window_text, *loss_part = rest.split(":", 1)
+        start_text, end_text = window_text.split("-", 1)
+        window_start = float(start_text)
+        window_end = float(end_text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid chain {spec!r}; expected ID:SPECIES=N@START-END[:loss=RATE]"
+        ) from None
+    targets: dict[str, int] = {}
+    for assignment in targets_text.split(","):
+        try:
+            species_id, amount_text = assignment.split("=", 1)
+            targets[species_id.strip()] = int(amount_text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"invalid chain target {assignment!r}; expected SPECIES=N"
+            ) from None
+    deactivation_rate = 0.0
+    if loss_part:
+        try:
+            key, rate_text = loss_part[0].split("=", 1)
+            if key.strip() != "loss":
+                raise ValueError
+            deactivation_rate = float(rate_text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"invalid chain loss {loss_part[0]!r}; expected loss=RATE"
+            ) from None
+    return ChainTarget(
+        chain_id=chain_id.strip(),
+        targets=targets,
+        window_start=window_start,
+        window_end=window_end,
+        deactivation_rate=deactivation_rate,
+    )
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     save_model(build_conservation_network(), args.model)
     print(f"saved built-in conservation model to {args.model}")
@@ -197,6 +245,47 @@ def cmd_deterministic(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_schedule(args: argparse.Namespace) -> None:
+    if args.state and Path(args.state).exists():
+        state = load_state(args.state)
+        runner = StochasticRunner.from_state(state)
+    else:
+        model = load_model(args.model)
+        runner = StochasticRunner(model, seed=args.seed)
+    for time_value, rate_constants in args.condition or []:
+        runner.schedule_condition_change(time_value, rate_constants, label="cli")
+    for time_value, kind, options in args.fate or []:
+        runner.schedule_waiting_fate(time_value, kind, label="cli", **options)
+    chains = list(args.chain)
+    failure = None
+    try:
+        if args.policy == "both":
+            reports = compare_policies(runner, chains, args.capacity, args.end_time)
+        else:
+            reports = {
+                args.policy: execute_schedule(
+                    runner, chains, args.capacity,
+                    policy=args.policy, end_time=args.end_time,
+                )
+            }
+    except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+        reports = {}
+    print_json(
+        {
+            "capacity": args.capacity,
+            "chains": [chain.to_dict() for chain in chains],
+            "policies": list(POLICIES),
+            "reports": {
+                policy: report.to_dict() for policy, report in reports.items()
+            },
+            "failure_reason": failure,
+        }
+    )
+    if failure is not None:
+        sys.exit(1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Offline synthetic biochemical reaction experiments")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -243,6 +332,50 @@ def build_parser() -> argparse.ArgumentParser:
     deterministic_parser.add_argument("--end-time", type=float, required=True)
     deterministic_parser.add_argument("--step-size", type=float, default=0.05)
     deterministic_parser.set_defaults(func=cmd_deterministic)
+
+    schedule_parser = subparsers.add_parser(
+        "schedule",
+        help="study release-resource scheduling across reaction chains",
+    )
+    schedule_parser.add_argument("--model", default="artifacts/model.json")
+    schedule_parser.add_argument("--state", default=None)
+    schedule_parser.add_argument("--seed", type=int, default=1)
+    schedule_parser.add_argument("--end-time", type=float, required=True)
+    schedule_parser.add_argument(
+        "--capacity",
+        type=float,
+        required=True,
+        help="maximum number of releases per unit time",
+    )
+    schedule_parser.add_argument(
+        "--chain",
+        action="append",
+        type=parse_chain,
+        required=True,
+        metavar="ID:SPECIES=N@START-END[:loss=RATE]",
+        help="declare one chain's target, release window and deactivation rate",
+    )
+    schedule_parser.add_argument(
+        "--policy",
+        choices=[*POLICIES, "both"],
+        default="both",
+        help="scheduling policy to execute",
+    )
+    schedule_parser.add_argument(
+        "--condition",
+        action="append",
+        type=parse_condition,
+        metavar="TIME:REACTION=RATE",
+        help="schedule a replayable rate change before the study",
+    )
+    schedule_parser.add_argument(
+        "--fate",
+        action="append",
+        type=parse_fate,
+        metavar="TIME:KIND[:KEY=VALUE]",
+        help="schedule a waiting fate (deviation source) before the study",
+    )
+    schedule_parser.set_defaults(func=cmd_schedule)
     return parser
 
 
