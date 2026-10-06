@@ -7,6 +7,14 @@ from biochem.deterministic import rk4_scan
 from biochem.models import ExperimentModel, Reaction, Species, build_conservation_network
 from biochem.persistence import load_state, save_state
 from biochem.rules import MassActionRule
+from biochem.scheduling import (
+    ReleaseChain,
+    ReleaseConstraints,
+    apply_release_plan,
+    build_release_plan,
+    compare_release_strategies,
+    replan_after_actuals,
+)
 from biochem.stochastic import PendingRelease, StochasticRunner
 
 
@@ -905,3 +913,179 @@ def test_cancel_unknown_or_released_batch_fails():
     assert runner.state.status == "failed"
     assert all(count >= 0 for count in runner.state.waiting_counts.values())
     assert all(count >= 0 for count in runner.state.cancelled_counts.values())
+
+
+def _shared_release_runner():
+    model = ExperimentModel(
+        species=tuple(Species(species_id) for species_id in ("I", "A", "J", "B")),
+        reactions=(
+            Reaction("make_a", {"I": 1}, {"A": 1}, 0.0, product_delays={"A": 1.0}),
+            Reaction("make_b", {"J": 1}, {"B": 1}, 0.0, product_delays={"B": 1.0}),
+        ),
+        initial_counts={"I": 2, "A": 2, "J": 1, "B": 1},
+    )
+    runner = StochasticRunner(model, seed=1)
+    runner.state.counts.update({"I": 2, "A": 0, "J": 1, "B": 0})
+    runner.state.waiting_counts.update({"A": 2, "B": 1})
+    runner.state.pending_releases = [
+        PendingRelease(
+            release_id="release-000001",
+            source_event_id="event-source-a",
+            reaction_id="make_a",
+            products={"A": 2},
+            created_time=0.0,
+            scheduled_time=0.9,
+            condition_version=0,
+        ),
+        PendingRelease(
+            release_id="release-000002",
+            source_event_id="event-source-b",
+            reaction_id="make_b",
+            products={"B": 1},
+            created_time=0.0,
+            scheduled_time=1.0,
+            condition_version=0,
+        ),
+    ]
+    return runner
+
+
+def _shared_chains():
+    return (
+        ReleaseChain(
+            chain_id="chain-a",
+            reaction_ids=frozenset({"make_a"}),
+            target_species="A",
+            target_amount=1,
+            window_start=0.0,
+            window_end=4.0,
+        ),
+        ReleaseChain(
+            chain_id="chain-b",
+            reaction_ids=frozenset({"make_b"}),
+            target_species="B",
+            target_amount=1,
+            window_start=0.0,
+            window_end=4.0,
+        ),
+    )
+
+
+def test_shared_release_capacity_compares_target_time_and_inactivation():
+    state = _shared_release_runner().state
+    chains = _shared_chains()
+    constraints = ReleaseConstraints(
+        capacity_per_slot=1,
+        slot_interval=1.0,
+        inactivation_before={"release-000001": 1.1, "release-000002": 1.0},
+    )
+
+    comparison = compare_release_strategies(state, chains, constraints)
+
+    assert [
+        placement.release_id
+        for placement in comparison.earliest_target.commitments
+    ] == ["release-000001", "release-000002"]
+    assert comparison.earliest_target.target_met_times == {
+        "chain-a": 1.0,
+        "chain-b": 2.0,
+    }
+    assert comparison.earliest_target.expected_deactivated == {"B": 1}
+
+    assert [
+        placement.release_id
+        for placement in comparison.minimum_inactivation.commitments
+    ] == ["release-000002", "release-000001"]
+    assert comparison.minimum_inactivation.target_met_times == {
+        "chain-a": 2.0,
+        "chain-b": 1.0,
+    }
+    assert comparison.minimum_inactivation.expected_deactivated == {"A": 2}
+
+
+def test_one_derived_batch_cannot_commit_to_two_chains():
+    runner = _shared_release_runner()
+    runner.state.pending_releases[1] = PendingRelease(
+        release_id="release-000002",
+        source_event_id="event-source-a",
+        reaction_id="make_b",
+        products={"B": 1},
+        created_time=0.0,
+        scheduled_time=1.0,
+        condition_version=0,
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be committed to two chains"):
+        build_release_plan(runner.state, _shared_chains())
+
+
+def test_actual_deviation_replans_future_while_retaining_released_history():
+    runner = _shared_release_runner()
+    chains = _shared_chains()
+    initial_plan = build_release_plan(runner.state, chains, "earliest_target")
+    apply_release_plan(runner, initial_plan)
+
+    # One unit of the A-derived batch actually converts before release.  This
+    # deviation does not remove its source reaction or its remaining waiting unit.
+    runner.schedule_waiting_fate(
+        0.5,
+        "convert",
+        release_id="release-000001",
+        products={"A": 1},
+        amount=1,
+    )
+    runner.run(0.5)
+    revised = replan_after_actuals(
+        runner,
+        chains,
+        "earliest_target",
+        ReleaseConstraints(capacity_per_slot=1, slot_interval=1.0, gate_open_time=3.0),
+    )
+    revised_ids = [placement.release_id for placement in revised.placements]
+    assert revised_ids == ["release-000001", "release-000002"]
+    assert [placement.release_time for placement in revised.placements] == [3.0, 4.0]
+    assert revised.unmet_targets == {}
+
+    apply_release_plan(runner, revised)
+    runner.schedule_waiting_fate(1.0, "block_releases")
+    runner.schedule_waiting_fate(3.0, "allow_releases")
+    runner.run(4.0)
+    state = runner.state
+
+    releases = [event for event in state.events if event.event_type == "release"]
+    assert [(event.release_id, event.time) for event in releases] == [
+        ("release-000001", 3.0),
+        ("release-000002", 4.0),
+    ]
+    assert all(next(iter(event.changes.values())) == 1 for event in releases)
+    assert state.counts == {"I": 2, "A": 1, "J": 1, "B": 1}
+    assert state.converted_counts == {"I": 0, "A": 1, "J": 0, "B": 0}
+    assert state.waiting_counts == {"I": 0, "A": 0, "J": 0, "B": 0}
+    assert state.pending_releases == []
+    assert sum(state.counts.values()) + sum(state.converted_counts.values()) == 6
+
+
+def test_partial_cancel_and_closed_gate_leave_batchwise_conservation():
+    runner = _shared_release_runner()
+    chains = _shared_chains()
+    apply_release_plan(runner, build_release_plan(runner.state, chains))
+    runner.schedule_waiting_fate(
+        0.4,
+        "cancel_release",
+        release_id="release-000001",
+        products={"A": 1},
+        amount=1,
+    )
+    runner.schedule_waiting_fate(0.8, "block_releases", release_id="release-000001")
+    runner.schedule_waiting_fate(2.0, "allow_releases", release_id="release-000001")
+    runner.run(3.0)
+
+    state = runner.state
+    released = {event.release_id: event for event in state.events if event.event_type == "release"}
+    assert released["release-000001"].changes == {"A": 1}
+    assert released["release-000001"].source_event_id == "event-source-a"
+    assert released["release-000002"].changes == {"B": 1}
+    assert state.cancelled_counts["A"] == 1
+    assert state.counts["A"] == 1
+    assert state.counts["B"] == 1
+    assert sum(state.counts.values()) + sum(state.cancelled_counts.values()) == 6

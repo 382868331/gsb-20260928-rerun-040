@@ -2,6 +2,14 @@
 
 from .models import ExperimentModel, Reaction, Species
 from .rules import MassActionRule, ReactionRule
+from .scheduling import (
+    ReleaseChain,
+    ReleaseConstraints,
+    ReleasePlan,
+    build_release_plan,
+    compare_release_strategies,
+    replan_after_actuals,
+)
 from .stochastic import (
     PendingRelease,
     SequesteredLot,
@@ -15,6 +23,10 @@ __all__ = [
     "MassActionRule",
     "Reaction",
     "ReactionRule",
+    "ReleaseChain",
+    "ReleaseConstraints",
+    "ReleasePlan",
+    "compare_release_strategies",
     "SequesteredLot",
     "Species",
     "StochasticRunner",
